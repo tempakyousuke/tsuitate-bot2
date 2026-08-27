@@ -98,8 +98,10 @@ function endGame(g: Game, result: string, reason: string) {
 	}
 }
 
-function startGame(a: Socket, b: Socket) {
+function startGame(first: Socket, second: Socket) {
 	const id = `g${++gameSeq}`;
+	// 接続順による先後の偏りを避けるため、1局ごとに先後を入れ替える
+	const [a, b] = gameSeq % 2 === 1 ? [first, second] : [second, first];
 	const pos = parseSfen('standard', initialSfen('standard')).unwrap() as Shogi;
 	const g: Game = {
 		id,
@@ -188,13 +190,14 @@ ioServer.on('connection', (socket) => {
 				return;
 			}
 
-			// 取られる駒(相手側から見た通知用)
+			// 取られる駒。サイト(engine.ts captureOf)と同じく盤上種別で通知する
+			// (成駒なら 'tokin' などのまま。unpromoteしてはいけない)
 			let captured: string | undefined;
 			let capturedSquare: string | undefined;
 			if (!('role' in md)) {
 				const target = g.pos.board.get(md.to);
 				if (target && target.color !== color) {
-					captured = unpromoteStd(target.role) ?? target.role;
+					captured = target.role;
 					capturedSquare = makeSquareName(md.to);
 				}
 			}

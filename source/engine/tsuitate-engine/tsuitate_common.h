@@ -132,7 +132,7 @@ struct Config {
 	int  stage1Samples  = 24;    // stage1(静止探索)に使う粒子数
 	int  stage2Samples  = 48;    // stage2(深い探索)に使う粒子数
 	int  stage2TopK     = 12;    // stage2に進める候補数
-	int  searchDepth    = 4;     // stage2の探索深さ(時間があれば反復深化)
+	int  searchDepth    = 6;     // stage2の探索深さの上限(時間が尽きれば手前で打ち切る)
 	int  budgetMs       = 2000;  // 1手の思考予算の既定値(goで上書き可)
 	int  regenTries     = 4000;  // 粒子再生成のリプレイ試行上限
 	double policyTemp   = 120.0; // 相手手サンプリングのsoftmax温度(centipawn)
