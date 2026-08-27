@@ -1,0 +1,19 @@
+{
+	"name": "tsuitate-bot2-bridge",
+	"private": true,
+	"type": "module",
+	"description": "beta.tsuitate.info のSocket.IO対局APIと、ついたて将棋エンジン(C++)を接続するブリッジ",
+	"scripts": {
+		"start": "tsx src/bridge.ts"
+	},
+	"dependencies": {
+		"shogiops": "^0.21.0",
+		"socket.io": "^4.8.3",
+		"socket.io-client": "^4.8.3"
+	},
+	"devDependencies": {
+		"@types/node": "^22.20.1",
+		"tsx": "^4.23.12",
+		"typescript": "^5.9.3"
+	}
+}
