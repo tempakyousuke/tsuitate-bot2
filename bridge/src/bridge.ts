@@ -17,7 +17,10 @@
  *   「次のイベントかgoが来た時点で王手なし確定」という規約がそのまま成り立つ。
  *   goの前に game:sync の往復を挟むことで、直前の王手宣言の到着も保証される。
  */
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, type ChildProcessByStdio } from 'node:child_process';
+import type { Readable, Writable } from 'node:stream';
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { io, type Socket } from 'socket.io-client';
 
@@ -30,6 +33,7 @@ const enginePath = process.env.TSUITATE_ENGINE_PATH ?? '../source/YaneuraOu-by-g
 const queueRetryMs = Number(process.env.TSUITATE_QUEUE_RETRY_MS ?? 60_000);
 const thinkDelayMs = Number(process.env.TSUITATE_THINK_MS ?? 200);
 const engineOptions = process.env.TSUITATE_ENGINE_OPTS ?? ''; // 例: "particles 256,depth 4"
+const recordDir = process.env.TSUITATE_RECORD_DIR ?? 'records'; // 空文字で無効
 
 if (!token) {
 	console.error('環境変数 TSUITATE_BOT_TOKEN にAPIトークンを設定してください');
@@ -66,7 +70,7 @@ type MoveAck =
 // エンジン子プロセス
 // ---------------------------------------------------------------------------
 class Engine {
-	private proc: ChildProcessWithoutNullStreams;
+	private proc: ChildProcessByStdio<Writable, Readable, null>;
 	private waiters: ((line: string) => boolean)[] = [];
 
 	constructor(path: string) {
@@ -122,6 +126,20 @@ let myColor: Color = 'sente';
 let lastSentUsi: string | null = null;
 let thinkTimer: ReturnType<typeof setTimeout> | null = null;
 let thinking = false;
+
+/** 対局記録(JSONL)。観測イベントをそのまま時系列で残す(後の分析・再現用) */
+function record(event: string, payload: unknown): void {
+	if (!recordDir || !gameId) return;
+	try {
+		mkdirSync(recordDir, { recursive: true });
+		appendFileSync(
+			join(recordDir, `${gameId}.jsonl`),
+			JSON.stringify({ ts: Date.now(), event, payload }) + '\n'
+		);
+	} catch {
+		// 記録失敗で対局を止めない
+	}
+}
 
 function joinQueue(): void {
 	socket.emit('queue:join', (res: { ok: boolean; error?: string }) => {
@@ -179,6 +197,7 @@ async function think(): Promise<void> {
 				// (ackとイベントの到着順に依存しないようにする)
 			} else if (ack.reason === 'foul') {
 				console.log(`反則: ${usi} (累計${ack.foulCount})`);
+				record('foul', { usi, foulCount: ack.foulCount });
 				engine.send(`foul ${usi}`);
 				scheduleThink(100);
 			} else {
@@ -195,8 +214,8 @@ async function think(): Promise<void> {
 
 socket.on('connect', () => {
 	console.log(`接続しました: ${url}`);
-	// 進行中の対局があれば game:active → game:sync で復帰する
-	joinQueue();
+	// 対局中の再接続なら game:active → 復帰。そうでなければキューへ
+	if (!gameId) joinQueue();
 });
 
 socket.on('connect_error', (err: Error) => {
@@ -216,12 +235,14 @@ socket.on('match:found', (payload: { gameId: string; yourColor: Color }) => {
 	myColor = payload.yourColor;
 	lastSentUsi = null;
 	engine.send(`new ${myColor}`);
+	record('matchFound', payload);
 	console.log(`マッチ成立: ${myColor} 番 (gameId=${payload.gameId})`);
 });
 
 socket.on('game:state', () => scheduleThink(thinkDelayMs));
 
 socket.on('game:moveAccepted', (payload: { captured?: string }) => {
+	record('moveAccepted', { usi: lastSentUsi, ...payload });
 	if (lastSentUsi) {
 		engine.send(`moveok ${lastSentUsi}` + (payload.captured ? ` cap ${payload.captured}` : ''));
 		lastSentUsi = null;
@@ -229,6 +250,7 @@ socket.on('game:moveAccepted', (payload: { captured?: string }) => {
 });
 
 socket.on('game:opponentMoved', (payload: { capturedYourPieceAt?: string }) => {
+	record('opponentMoved', payload);
 	engine.send(
 		'oppmove' + (payload.capturedYourPieceAt ? ` cap ${payload.capturedYourPieceAt}` : '')
 	);
@@ -239,15 +261,18 @@ socket.on('game:foul', () => {
 	// ackの側で処理済み(fouled手はエンジンへ通知済み)。時計精算のみのイベント
 });
 
-socket.on('game:opponentFoul', () => {
+socket.on('game:opponentFoul', (payload: { opponentFoulCount: number }) => {
+	record('opponentFoul', payload);
 	engine.send('oppfoul');
 });
 
 socket.on('game:check', (payload: { inCheck: Color }) => {
+	record('check', payload);
 	engine.send(`check ${payload.inCheck === myColor ? 'you' : 'opp'}`);
 });
 
 socket.on('game:end', (payload: any) => {
+	record('end', payload);
 	console.log(
 		`終局: ${payload.result} (${payload.reason}) — vs ${payload.opponent?.username} (R${payload.opponent?.rating})` +
 			` レート: ${payload.ratingChange?.you?.before} → ${payload.ratingChange?.you?.after}`

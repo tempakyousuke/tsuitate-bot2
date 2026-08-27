@@ -185,7 +185,7 @@ private:
 			if (myTime >= 0) {
 				// フィッシャー時計: increment をほぼ使い切り、残り時間の一部を上乗せ
 				budget = inc * 4 / 5 + myTime / 40;
-				budget = std::max(300L, std::min(budget, 4000L));
+				budget = std::max(300L, std::min(budget, 3000L));
 				// 残り時間が少ないときは絞る
 				if (myTime < 20000)
 					budget = std::max(200L, myTime / 20);

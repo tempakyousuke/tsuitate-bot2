@@ -106,10 +106,17 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		return out;
 	};
 
-	// 4) stage1: 全候補を静止探索で粗く評価
+	// 4) stage1: 全候補を静止探索で粗く評価。
+	// 締め切りが迫ったらサンプル数を段階的に絞る(全候補に必ず何らかの値を付ける)
 	std::vector<double> mean1(M, 0.0), comb1(M);
 	for (size_t i = 0; i < M; ++i) {
-		auto sel = pick_particles(legalIdx[i], size_t(cfg.stage1Samples));
+		size_t k1 = size_t(cfg.stage1Samples);
+		TimePoint t = now();
+		if (t > deadline - 100)
+			k1 = 1;
+		else if (t > t0 + budgetMs * 7 / 10)
+			k1 = std::min<size_t>(k1, 4);
+		auto sel = pick_particles(legalIdx[i], k1);
 		double sum = 0;
 		for (uint32_t j : sel) {
 			Position& pos = parts[j]->pos;
