@@ -74,12 +74,34 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	// 3) 合法率と「合法な粒子のindex」を全候補について求める
 	const size_t M = cands.size();
 	std::vector<std::vector<uint32_t>> legalIdx(M);
-	for (size_t j = 0; j < N; ++j)
-		for (size_t i = 0; i < M; ++i)
-			if (parts[j]->legal(cands[i]))
-				legalIdx[i].push_back(uint32_t(j));
+	auto scan_legality = [&]() {
+		for (auto& v : legalIdx)
+			v.clear();
+		for (size_t j = 0; j < belief.particles().size(); ++j)
+			for (size_t i = 0; i < M; ++i)
+				if (belief.particles()[j]->legal(cands[i]))
+					legalIdx[i].push_back(uint32_t(j));
+	};
+	scan_legality();
 
-	auto p_legal = [&](size_t i) { return double(legalIdx[i].size()) / double(N); };
+	// 信念の破産検出: 全候補が全粒子で不正 = 信念が確実に間違っている
+	// (真の局面に合法手がなければサーバーが終局させているはず)。
+	// 粒子を捨てて合成粒子で作り直す。ここで反則を重ねても情報はゼロ
+	// (「全滅の予測どおり」なので粒子が1つも死なない)なので、続行は最悪手。
+	{
+		size_t maxLegal = 0;
+		for (size_t i = 0; i < M; ++i)
+			maxLegal = std::max(maxLegal, legalIdx[i].size());
+		if (maxLegal == 0) {
+			belief.force_resynthesize(view);
+			res.nParticles = belief.size();
+			res.relaxLevel = belief.relaxLevel();
+			scan_legality();
+		}
+	}
+	const size_t NP = belief.particles().size() ? belief.particles().size() : 1;
+
+	auto p_legal = [&](size_t i) { return double(legalIdx[i].size()) / double(NP); };
 
 	// 反則コスト(centipawn)。累計10回で反則負けなので、残り予算が減るほど急騰させる。
 	double remain = std::max(1.0, 10.0 - view.ourFouls);
@@ -87,7 +109,7 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	// 信念の品質が悪い(緩和粒子・粒子不足)ときはp_legalの推定が信用できないので、
 	// リスクをさらに重く見る。反則→粒子死→さらに反則、のスパイラルを断つ。
 	foulCp *= 1.0 + 1.5 * belief.relaxLevel();
-	if (N * 4 < size_t(cfg.particles))
+	if (NP * 4 < size_t(cfg.particles))
 		foulCp *= 2.0;
 
 	auto combined = [&](size_t i, double meanCp) {

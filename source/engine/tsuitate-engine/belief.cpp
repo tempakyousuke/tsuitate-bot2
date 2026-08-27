@@ -367,6 +367,29 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 				if (board[sq] != NO_PIECE)
 					occ = occ | sq;
 			bool placed = false;
+
+			// 直前に自駒が取られたマスがあるなら、王手駒はそこにいる可能性が高い
+			// (取ったその駒が王手をかけている)。まずそのマスへの配置を試す。
+			Square hint = view.lastOppCaptureSq;
+			if (hint != SQ_NB && board[hint] == NO_PIECE
+			    && (rng_.rand<uint64_t>() % 100) < 85) {
+				for (int promo = 1; promo >= 0 && !placed; --promo) {  // 成り優先(と金攻めが典型)
+					if (checkerRaw == GOLD && promo)
+						continue;
+					PieceType pt = promo ? PieceType(checkerRaw | 8) : checkerRaw;
+					if (effects_from(make_piece(opp, pt), hint, occ) & ksq) {
+						if (!promo && checkerRaw == PAWN
+						    && (pawnFile[file_of(hint)] || !piece_can_stay(opp, PAWN, hint)))
+							continue;
+						if (!promo && (checkerRaw == LANCE || checkerRaw == KNIGHT)
+						    && !piece_can_stay(opp, checkerRaw, hint))
+							continue;
+						board[hint] = make_piece(opp, pt);
+						placed = true;
+					}
+				}
+			}
+
 			for (int promo = 0; promo < 2 && !placed; ++promo) {
 				if (checkerRaw == GOLD && promo)
 					break;
@@ -445,6 +468,20 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 		return p;
 	}
 	return nullptr;
+}
+
+void Belief::force_resynthesize(const OwnView& view) {
+	parts_.clear();
+	int misses = 0;
+	size_t target = std::max<size_t>(16, size_t(cfg_.particles) / 4);
+	while (parts_.size() < target && misses < 400) {
+		auto p = synthesize(view);
+		if (p)
+			parts_.push_back(std::move(p));
+		else
+			++misses;
+	}
+	relaxLevel_ = 3;
 }
 
 ParticlePtr Belief::replay_one(const GameHistory& hist, int relax,

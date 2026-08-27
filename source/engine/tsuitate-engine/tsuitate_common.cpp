@@ -57,6 +57,7 @@ void OwnView::apply_our_move(Move m, PieceType capRole) {
 }
 
 void OwnView::apply_opp_capture(Square capSq) {
+	lastOppCaptureSq = capSq;
 	if (capSq == SQ_NB)
 		return;
 	Piece pc = board[capSq];

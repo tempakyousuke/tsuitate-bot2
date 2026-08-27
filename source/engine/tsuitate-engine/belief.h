@@ -71,6 +71,11 @@ public:
 	// deadline: 再生成に使ってよい時刻(now() + ms)。
 	void sync(const GameHistory& hist, const OwnView& view, TimePoint deadline);
 
+	// 信念の破産処理: 現在の粒子集合を破棄し、合成粒子だけで作り直す。
+	// 「全候補手が全粒子で不正」のような、信念が確実に間違っている状況で呼ぶ
+	// (詰みならサーバーが終局させるので、合法手は必ず存在する)。
+	void force_resynthesize(const OwnView& view);
+
 	const std::vector<ParticlePtr>& particles() const { return parts_; }
 	size_t size() const { return parts_.size(); }
 	int    relaxLevel() const { return relaxLevel_; }
