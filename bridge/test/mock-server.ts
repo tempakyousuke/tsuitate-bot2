@@ -31,6 +31,7 @@ interface Game {
 	id: string;
 	pos: Shogi;
 	players: Record<Color, Socket>;
+	names: Record<Color, string>;
 	fouls: Record<Color, number>;
 	moveNumber: number;
 	ended: boolean;
@@ -87,7 +88,10 @@ function endGame(g: Game, result: string, reason: string) {
 		});
 		inGame.delete(g.players[color].id);
 	}
-	console.log(`game ${g.id}: ${result} (${reason}) after ${g.moveNumber - 1} moves, fouls=${g.fouls.sente}/${g.fouls.gote}`);
+	console.log(
+		`game ${g.id}: ${result} (${reason}) after ${g.moveNumber - 1} moves, ` +
+			`sente=${g.names.sente} gote=${g.names.gote} fouls=${g.fouls.sente}/${g.fouls.gote}`
+	);
 	if (games >= MAX_GAMES) {
 		console.log('MOCK_DONE');
 		setTimeout(() => process.exit(0), 500);
@@ -101,6 +105,10 @@ function startGame(a: Socket, b: Socket) {
 		id,
 		pos,
 		players: { sente: a, gote: b },
+		names: {
+			sente: String(a.handshake.auth?.token ?? '?'),
+			gote: String(b.handshake.auth?.token ?? '?')
+		},
 		fouls: { sente: 0, gote: 0 },
 		moveNumber: 1,
 		ended: false
@@ -113,7 +121,7 @@ function startGame(a: Socket, b: Socket) {
 		a.emit('game:state', playerView(g, 'sente'));
 		b.emit('game:state', playerView(g, 'gote'));
 	}, 50);
-	console.log(`game ${id}: start`);
+	console.log(`game ${id}: start sente=${g.names.sente} gote=${g.names.gote}`);
 }
 
 ioServer.on('connection', (socket) => {
