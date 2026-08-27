@@ -1,0 +1,8 @@
+obj/
+source/YaneuraOu-by-gcc
+source/YaneuraOu-by-gcc.exe
+*.o
+*.d
+bridge/node_modules/
+bridge/dist/
+.env
