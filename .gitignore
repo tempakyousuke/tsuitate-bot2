@@ -6,3 +6,4 @@ source/YaneuraOu-by-gcc.exe
 bridge/node_modules/
 bridge/dist/
 .env
+bridge/records/
