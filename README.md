@@ -77,6 +77,8 @@ printf "arena games 20 budget 300 particles 128\nquit\n" | ./YaneuraOu-by-gcc
 ```
 
 現状の実測: 前進ヒューリスティックに **20戦全勝**(反則2.2回/局)。
+前作 tsuitate-bot (Rust) との直接対決はまだ 0-6(主因は信念の質=反則経済。
+分析と次の一手は docs/design.md の 4.5 / 5 章)。
 
 ### ブリッジ込みのE2Eテスト
 
