@@ -72,7 +72,7 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	}
 
 	// 3) 合法率と「合法な粒子のindex」を全候補について求める
-	const size_t M = cands.size();
+	size_t M = cands.size();
 	std::vector<std::vector<uint32_t>> legalIdx(M);
 	auto scan_legality = [&]() {
 		for (auto& v : legalIdx)
@@ -100,6 +100,27 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		}
 	}
 	const size_t NP = belief.particles().size() ? belief.particles().size() : 1;
+
+	// 確実な反則(どの粒子でも不正)は候補から外す。指しても情報が得られない
+	// (「予測どおりの反則」は粒子を1つも殺さない)うえに1回を捨てるだけ。
+	// 悪い局面では foulCp が「悪いが合法な手」の評価を上回って確実反則が
+	// 選ばれてしまう、という実対戦で観測されたパターンの直接の対策。
+	{
+		std::vector<Move>                  keptC;
+		std::vector<std::vector<uint32_t>> keptL;
+		for (size_t i = 0; i < M; ++i)
+			if (!legalIdx[i].empty()) {
+				keptC.push_back(cands[i]);
+				keptL.push_back(std::move(legalIdx[i]));
+			}
+		if (!keptC.empty()) {
+			cands    = std::move(keptC);
+			legalIdx = std::move(keptL);
+			M        = cands.size();
+		}
+		// keptCが空 = 破産処理後もなお全滅。この場合は元の候補のまま進み、
+		// 下の「合法粒子ゼロでも評価」経路(ヒューリスティック相当)に任せる。
+	}
 
 	auto p_legal = [&](size_t i) { return double(legalIdx[i].size()) / double(NP); };
 
