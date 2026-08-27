@@ -44,8 +44,8 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	const TimePoint deadline = t0 + budgetMs;
 	ThinkResult res;
 
-	// 1) 信念の同期(再生成には予算の40%まで使う)
-	belief.sync(hist, view, t0 + budgetMs * 2 / 5);
+	// 1) 信念の同期(再生成には予算の cfg.syncPct% まで使う)
+	belief.sync(hist, view, t0 + budgetMs * cfg.syncPct / 100);
 	res.nParticles = belief.size();
 	res.relaxLevel = belief.relaxLevel();
 

@@ -22,7 +22,10 @@ struct ArenaOptions {
 	// プレイヤー種別: "belief"(本体) / "heuristic"(前進ヒューリスティック)
 	std::string p1 = "belief";
 	std::string p2 = "heuristic";
-	Config   cfg;                  // belief側の設定
+	// belief側の設定。p1/p2で別々に持てるので、同一バイナリ内でA/B比較ができる
+	// (`p1cfg <key> <val>` / `p2cfg <key> <val>` で個別に上書きする)。
+	Config   cfg;
+	Config   cfg2;
 	bool     verbose = false;
 };
 

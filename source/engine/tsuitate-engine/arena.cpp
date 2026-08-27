@@ -25,13 +25,27 @@ struct IPlayer {
 	virtual void on_our_foul(Move m) = 0;
 	virtual void on_opp_move(Square capSq, bool gaveCheck) = 0;
 	virtual void on_opp_foul() = 0;
+	// 診断用フック(審判だけが持つ完全情報を渡す。思考には使わない)
+	virtual void observe_truth(const Position&) {}
+	virtual void observe_verdict(bool /*wasLegal*/) {}
 };
 
-// 診断用の集計(アリーナ全体)
+// 診断用の集計(プレイヤーごと)
+//
+// 反則が勝敗を決める競技なので、「信念がどれだけ真の局面に近いか」を
+// 審判の完全情報と突き合わせて直接測る。変更はこの数字とセットで評価すること。
+//   king_acc … 相手玉のマスを当てている粒子の割合(信念の芯の鋭さ)
+//   occ_rec  … 真の相手駒のうち、粒子が正しいマスに置けている割合(再現率)
+//   brier    … p_legalの較正誤差(選んだ手の合法性の予測 vs 実際)。小さいほど良い
 struct ArenaStats {
 	long long thinks = 0, particleSum = 0, relaxSum = 0, zeroParticle = 0;
 	long long pLegalPctSum = 0;
 	long long fouls = 0, foulsAfterZero = 0, foulsAfterRelax = 0;
+	double    kingAccSum = 0, occAccSum = 0;
+	long long truthSamples = 0;
+	double    brierSum = 0;
+	long long brierSamples = 0;
+	long long relaxHist[4] = {};  // 緩和レベル別の思考回数(3=合成粒子)
 	void add(const ThinkResult& r) {
 		thinks++;
 		particleSum += r.nParticles;
@@ -39,26 +53,71 @@ struct ArenaStats {
 		pLegalPctSum += (long long)(r.pLegal * 100);
 		if (r.nParticles == 0)
 			zeroParticle++;
+		if (r.relaxLevel >= 0 && r.relaxLevel < 4)
+			relaxHist[r.relaxLevel]++;
 	}
 };
-ArenaStats g_stats;
+ArenaStats g_stats[2];
 
 // 本体(信念+確定化探索)
 struct BeliefPlayer : IPlayer {
 	BotCore core;
 	Config  cfg;
 	int     budgetMs;
+	int     slot;  // g_stats のインデックス(p1=0 / p2=1)
 
-	BeliefPlayer(const Config& c, int budget) : cfg(c), budgetMs(budget) {}
+	BeliefPlayer(const Config& c, int budget, int slot_)
+	    : cfg(c), budgetMs(budget), slot(slot_) {}
 
 	ThinkResult lastResult;
 
 	void new_game(Color us) override { core.new_game(us, cfg); }
 	Move choose() override {
 		ThinkResult r = core.think(budgetMs);
-		g_stats.add(r);
+		g_stats[slot].add(r);
 		lastResult = r;
 		return r.best;
+	}
+	// 審判の完全情報と信念を突き合わせる(診断専用。思考には一切使わない)
+	void observe_truth(const Position& truth) override {
+		const auto& parts = core.belief().particles();
+		if (parts.empty())
+			return;
+		const Color opp     = ~core.view().us;
+		const Square trueK  = truth.square<KING>(opp);
+		uint64_t     trueOcc[2] = {};  // 相手駒の占有(81bitを2ワードに)
+		for (auto sq : SQ) {
+			Piece pc = truth.piece_on(sq);
+			if (pc != NO_PIECE && color_of(pc) == opp)
+				trueOcc[sq >= 64] |= 1ull << (sq & 63);
+		}
+		long long kingHit = 0, occHit = 0;
+		for (const auto& p : parts) {
+			if (p->pos.square<KING>(opp) == trueK)
+				++kingHit;
+			uint64_t o0 = 0, o1 = 0;
+			for (auto sq : SQ) {
+				Piece pc = p->pos.piece_on(sq);
+				if (pc != NO_PIECE && color_of(pc) == opp)
+					(sq >= 64 ? o1 : o0) |= 1ull << (sq & 63);
+			}
+			// 真の相手駒のマスを言い当てた数
+			occHit += POPCNT64(o0 & trueOcc[0]) + POPCNT64(o1 & trueOcc[1]);
+		}
+		int trueN = POPCNT64(trueOcc[0]) + POPCNT64(trueOcc[1]);
+		ArenaStats& st = g_stats[slot];
+		st.kingAccSum += double(kingHit) / double(parts.size());
+		if (trueN > 0)
+			st.occAccSum += double(occHit) / double(parts.size()) / double(trueN);
+		st.truthSamples++;
+	}
+	// 選んだ手が実際に合法だったか(p_legalの較正=Brierスコア)
+	void observe_verdict(bool wasLegal) override {
+		if (lastResult.best == Move::none() || lastResult.nParticles == 0)
+			return;
+		double d = lastResult.pLegal - (wasLegal ? 1.0 : 0.0);
+		g_stats[slot].brierSum += d * d;
+		g_stats[slot].brierSamples++;
 	}
 	void on_our_move_accepted(Move m, PieceType capRole, bool gaveCheck) override {
 		core.on_our_move_accepted(m, capRole);
@@ -67,11 +126,11 @@ struct BeliefPlayer : IPlayer {
 	}
 	void on_our_foul(Move m) override {
 		core.on_our_foul(m);
-		g_stats.fouls++;
+		g_stats[slot].fouls++;
 		if (lastResult.nParticles == 0)
-			g_stats.foulsAfterZero++;
+			g_stats[slot].foulsAfterZero++;
 		else if (lastResult.relaxLevel > 0)
-			g_stats.foulsAfterRelax++;
+			g_stats[slot].foulsAfterRelax++;
 	}
 	void on_opp_move(Square capSq, bool gaveCheck) override {
 		core.on_opp_move(capSq);
@@ -130,11 +189,11 @@ struct HeuristicPlayer : IPlayer {
 };
 
 std::unique_ptr<IPlayer> make_player(const std::string& kind, const ArenaOptions& opt,
-                                     uint64_t seed) {
+                                     uint64_t seed, int slot) {
 	if (kind == "belief") {
-		Config c = opt.cfg;
+		Config c = slot == 0 ? opt.cfg : opt.cfg2;
 		c.seed   = seed;
-		return std::make_unique<BeliefPlayer>(c, opt.budgetMs);
+		return std::make_unique<BeliefPlayer>(c, opt.budgetMs, slot);
 	}
 	return std::make_unique<HeuristicPlayer>(seed);
 }
@@ -167,6 +226,7 @@ GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool v
 		IPlayer* mover = players[side];
 		IPlayer* other = players[1 - side];
 
+		mover->observe_truth(pos);
 		Move m = mover->choose();
 		if (m == Move::none()) {
 			stat.winner = 1 - side;
@@ -175,7 +235,9 @@ GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool v
 		}
 
 		// 審判: 通常将棋ルールでの合法性
-		if (!(pos.pseudo_legal_s<true>(m) && pos.legal(m))) {
+		const bool wasLegal = pos.pseudo_legal_s<true>(m) && pos.legal(m);
+		mover->observe_verdict(wasLegal);
+		if (!wasLegal) {
 			fouls[side]++;
 			mover->on_our_foul(m);
 			if (fouls[side] >= MAX_FOULS) {
@@ -222,8 +284,8 @@ void run_arena(const ArenaOptions& opt) {
 
 	for (int g = 0; g < opt.games; ++g) {
 		uint64_t s1 = opt.seed + g * 2, s2 = opt.seed + g * 2 + 1;
-		auto     a  = make_player(opt.p1, opt, s1);
-		auto     b  = make_player(opt.p2, opt, s2);
+		auto     a  = make_player(opt.p1, opt, s1, 0);
+		auto     b  = make_player(opt.p2, opt, s2, 1);
 		// 先後を交互に入れ替える
 		bool p1Sente = (g % 2 == 0);
 		GameStat st  = p1Sente ? play_one(*a, *b, opt, opt.verbose)
@@ -252,17 +314,29 @@ void run_arena(const ArenaOptions& opt) {
 	          << ", fouls/game p1=" << (p1Fouls / n) << " p2=" << (p2Fouls / n)
 	          << ", avg plies=" << (plies / n)
 	          << ", elapsed=" << (now() - t0) / 1000 << "s" << std::endl;
-	if (g_stats.thinks > 0)
-		std::cout << "  belief diag: thinks=" << g_stats.thinks
-		          << " avg_particles=" << (g_stats.particleSum / g_stats.thinks)
-		          << " avg_relax=" << (double(g_stats.relaxSum) / g_stats.thinks)
-		          << " zero_particle=" << g_stats.zeroParticle
-		          << " avg_p_legal=" << (g_stats.pLegalPctSum / g_stats.thinks) << "%"
-		          << " fouls=" << g_stats.fouls
-		          << " (after_zero=" << g_stats.foulsAfterZero
-		          << " after_relax=" << g_stats.foulsAfterRelax << ")"
-		          << std::endl;
-	g_stats = ArenaStats();
+	for (int k = 0; k < 2; ++k) {
+		const ArenaStats& g = g_stats[k];
+		if (g.thinks == 0)
+			continue;
+		std::cout << "  belief diag[" << (k == 0 ? opt.p1 : opt.p2) << "#" << (k + 1) << "]:"
+		          << " thinks=" << g.thinks
+		          << " avg_particles=" << (g.particleSum / g.thinks)
+		          << " relax(0/1/2/synth)=" << g.relaxHist[0] << "/" << g.relaxHist[1]
+		          << "/" << g.relaxHist[2] << "/" << g.relaxHist[3]
+		          << " zero_particle=" << g.zeroParticle
+		          << " avg_p_legal=" << (g.pLegalPctSum / g.thinks) << "%"
+		          << " fouls=" << g.fouls
+		          << " (after_zero=" << g.foulsAfterZero
+		          << " after_relax=" << g.foulsAfterRelax << ")";
+		if (g.truthSamples)
+			std::cout << " king_acc=" << (100.0 * g.kingAccSum / double(g.truthSamples)) << "%"
+			          << " occ_rec=" << (100.0 * g.occAccSum / double(g.truthSamples)) << "%";
+		if (g.brierSamples)
+			std::cout << " brier=" << (g.brierSum / double(g.brierSamples));
+		std::cout << std::endl;
+	}
+	g_stats[0] = ArenaStats();
+	g_stats[1] = ArenaStats();
 }
 
 } // namespace Tsuitate

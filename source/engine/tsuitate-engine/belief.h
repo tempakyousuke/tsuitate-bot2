@@ -101,9 +101,18 @@ private:
 	static void consistent_opp_moves(const Particle& p, const HistEvent& ev,
 	                                 std::vector<Move>& out, int relax);
 
-	// 方策(浅い評価softmax)で1手選ぶ。excludeに入っている手は除く。
+	// 特定の1手だけの整合判定(全合法手の列挙を伴わない高速版)
+	static bool opp_move_consistent(const Particle& p, const HistEvent& ev,
+	                                Move m, int relax);
+
+	// 方策で1手選ぶ。excludeに入っている手は除く。
+	// cfg_.oppPolicy で相手モデルを切り替える(0=千里眼評価softmax / 1=非千里眼prior)。
 	Move sample_policy(Particle& p, const std::vector<Move>& moves,
 	                   const std::vector<Move>& exclude);
+
+	// この手番でこれまでに反則になった自分の手(履歴の末尾から導出)。
+	// 現局面に対する強い制約なので、合成粒子の棄却に使う。
+	std::vector<Move> curFouls_;
 
 	// 観測と矛盾して死んだ粒子の相手手列(部分若返りの種)
 	void bury(const Particle& p);

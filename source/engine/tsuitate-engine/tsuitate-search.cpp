@@ -16,7 +16,10 @@
 //                                          → bestmove <usi> | bestmove resign
 //   state                                  … デバッグ出力
 //   arena games <n> [p1 <kind>] [p2 <kind>] [budget <ms>] [seed <n>]
-//                                          … ローカル自己対戦(審判つき)
+//         [p1cfg <key> <val>] [p2cfg <key> <val>]
+//                                          … ローカル自己対戦(審判つき)。
+//                                            p1cfg/p2cfgで片側だけ設定を変えれば
+//                                            同一バイナリ内でA/B比較ができる
 #include "../../config.h"
 
 #if defined(TSUITATE_ENGINE)
@@ -38,6 +41,29 @@ namespace YaneuraOu {
 namespace Tsuitate {
 
 namespace {
+
+// 設定キーの適用。`set`(実対局)と`arena p1cfg/p2cfg`(A/B比較)で共有する。
+bool set_config_key(Config& c, const std::string& key, const std::string& val) {
+	if (key == "particles") c.particles = std::stoi(val);
+	else if (key == "stage1") c.stage1Samples = std::stoi(val);
+	else if (key == "stage2") c.stage2Samples = std::stoi(val);
+	else if (key == "topk") c.stage2TopK = std::stoi(val);
+	else if (key == "depth") c.searchDepth = std::stoi(val);
+	else if (key == "budget") c.budgetMs = std::stoi(val);
+	else if (key == "regentries") c.regenTries = std::stoi(val);
+	else if (key == "policytemp") c.policyTemp = std::stod(val);
+	else if (key == "policyeps") c.policyEps = std::stod(val);
+	else if (key == "foulbase") c.foulBaseCp = std::stod(val);
+	else if (key == "foulstep") c.foulStepCp = std::stod(val);
+	else if (key == "opppolicy") c.oppPolicy = std::stoi(val);
+	else if (key == "deduce") c.deduce = std::stoi(val);
+	else if (key == "syncpct") c.syncPct = std::stoi(val);
+	else if (key == "regenfloor") c.regenFloorPct = std::stoi(val);
+	else if (key == "seed") c.seed = std::stoull(val);
+	else if (key == "loglevel") c.logLevel = std::stoi(val);
+	else return false;
+	return true;
+}
 
 class ProtocolLoop {
 public:
@@ -102,15 +128,7 @@ private:
 	void cmd_set(std::istringstream& is) {
 		std::string key, val;
 		is >> key >> val;
-		if (key == "particles") cfg_.particles = std::stoi(val);
-		else if (key == "stage1") cfg_.stage1Samples = std::stoi(val);
-		else if (key == "stage2") cfg_.stage2Samples = std::stoi(val);
-		else if (key == "topk") cfg_.stage2TopK = std::stoi(val);
-		else if (key == "depth") cfg_.searchDepth = std::stoi(val);
-		else if (key == "budget") cfg_.budgetMs = std::stoi(val);
-		else if (key == "seed") cfg_.seed = std::stoull(val);
-		else if (key == "loglevel") cfg_.logLevel = std::stoi(val);
-		else {
+		if (!set_config_key(cfg_, key, val)) {
 			sync_cout << "info string unknown option: " << key << sync_endl;
 			return;
 		}
@@ -218,7 +236,8 @@ private:
 
 	void cmd_arena(std::istringstream& is) {
 		ArenaOptions opt;
-		opt.cfg = cfg_;
+		opt.cfg  = cfg_;
+		opt.cfg2 = cfg_;
 		std::string tok;
 		while (is >> tok) {
 			if (tok == "games") is >> opt.games;
@@ -226,9 +245,16 @@ private:
 			else if (tok == "p2") is >> opt.p2;
 			else if (tok == "budget") is >> opt.budgetMs;
 			else if (tok == "seed") is >> opt.seed;
-			else if (tok == "particles") is >> opt.cfg.particles;
+			else if (tok == "particles") { is >> opt.cfg.particles; opt.cfg2.particles = opt.cfg.particles; }
 			else if (tok == "verbose") opt.verbose = true;
 			else if (tok == "maxplies") is >> opt.maxPlies;
+			// A/B比較: 片側だけ設定を変えて同一バイナリ内で対戦させる
+			else if (tok == "p1cfg" || tok == "p2cfg") {
+				std::string k, v;
+				is >> k >> v;
+				if (!set_config_key(tok == "p1cfg" ? opt.cfg : opt.cfg2, k, v))
+					sync_cout << "info string unknown option: " << k << sync_endl;
+			}
 		}
 		run_arena(opt);
 	}
