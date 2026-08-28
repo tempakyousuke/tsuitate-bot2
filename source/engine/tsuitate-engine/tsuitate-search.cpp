@@ -61,6 +61,7 @@ bool set_config_key(Config& c, const std::string& key, const std::string& val) {
 	else if (key == "blocksamples") c.blockSamples = std::stoi(val);
 	else if (key == "opppolicy") c.oppPolicy = std::stoi(val);
 	else if (key == "deduce") c.deduce = std::stoi(val);
+	else if (key == "synthprior") c.synthPrior = std::stoi(val);
 	else if (key == "syncpct") c.syncPct = std::stoi(val);
 	else if (key == "regenfloor") c.regenFloorPct = std::stoi(val);
 	else if (key == "seed") c.seed = std::stoull(val);

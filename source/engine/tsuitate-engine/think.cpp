@@ -51,10 +51,10 @@ void block_map(const std::vector<ParticlePtr>& parts, Color us, size_t k,
                double out[SQ_NB]) {
 	for (auto sq : SQ)
 		out[sq] = 0.0;
-	if (parts.empty())
-		return;
-	const Color opp = ~us;
 	k = std::min(k, parts.size());
+	if (k == 0)
+		return;  // 粒子なし、または blockSamples=0(0除算でマップ全体がNaNになる)
+	const Color opp = ~us;
 	double votes[SQ_NB];
 	for (size_t t = 0; t < k; ++t) {
 		const Position& pos = parts[t * parts.size() / k]->pos;
@@ -180,7 +180,9 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		for (size_t i = 0; i < M; ++i)
 			maxLegal = std::max(maxLegal, legalIdx[i].size());
 		if (maxLegal == 0) {
-			belief.force_resynthesize(view);
+			// sync が予算の syncPct% を使ったあと。作り直しにも同じだけ上限を与える。
+			belief.force_resynthesize(view, std::min(now() + budgetMs * cfg.syncPct / 100,
+			                                        deadline - 50));
 			res.nParticles = belief.size();
 			res.relaxLevel = belief.relaxLevel();
 			scan_legality();

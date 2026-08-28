@@ -74,7 +74,8 @@ public:
 	// 信念の破産処理: 現在の粒子集合を破棄し、合成粒子だけで作り直す。
 	// 「全候補手が全粒子で不正」のような、信念が確実に間違っている状況で呼ぶ
 	// (詰みならサーバーが終局させるので、合法手は必ず存在する)。
-	void force_resynthesize(const OwnView& view);
+	// deadline: この時刻を過ぎたら足りなくても打ち切る。
+	void force_resynthesize(const OwnView& view, TimePoint deadline);
 
 	const std::vector<ParticlePtr>& particles() const { return parts_; }
 	size_t size() const { return parts_.size(); }

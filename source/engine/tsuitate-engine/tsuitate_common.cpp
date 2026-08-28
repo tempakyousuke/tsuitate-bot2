@@ -51,17 +51,18 @@ void OwnView::reset(Color us_) {
 
 	// 演繹の初期状態: 平手初期局面は相手の配置も完全に既知なので、
 	// 相手駒のないマスは全部「確実に空き(陳腐化度0)」から始まる。
-	// 相手陣は相対1段目(全筋)・2段目(2筋と8筋の角飛)・3段目(全筋の歩)。
+	// 相手陣は相手から見て1段目(全筋)・2段目(2筋と8筋の角飛)・3段目(全筋の歩)。
+	//
+	// 段の向きに注意: relative_rank(c, r) は「cの最奥が8」なので、
+	// 「相手から見た段」が欲しいときに引くのは relative_rank(opp, r) ではなく
+	// relative_rank(us, r) のほう(us の最奥 = 8 = 相手から見て9段目)。
 	oppMoveCount = 0;
-	{
-		const Color opp = ~us;
-		for (auto sq : SQ) {
-			Rank rr = relative_rank(opp, rank_of(sq));
-			File f  = file_of(sq);
-			bool oppPiece = (rr == RANK_1) || (rr == RANK_3)
-			                || (rr == RANK_2 && (f == FILE_2 || f == FILE_8));
-			emptyStamp[sq] = oppPiece ? -9999 : 0;
-		}
+	for (auto sq : SQ) {
+		Rank rr = relative_rank(us, rank_of(sq));  // 0 = 相手の最奥
+		File f  = file_of(sq);
+		bool oppPiece = (rr == RANK_1) || (rr == RANK_3)
+		                || (rr == RANK_2 && (f == FILE_2 || f == FILE_8));
+		emptyStamp[sq] = oppPiece ? -9999 : 0;
 	}
 
 	// 平手初期配置の自分側だけを置く。

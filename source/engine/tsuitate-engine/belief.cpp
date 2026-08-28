@@ -20,6 +20,7 @@ void Belief::reset(Color us, const Config& cfg) {
 	relaxLevel_ = 0;
 	parts_.clear();
 	graveyard_.clear();
+	curFouls_.clear();
 	for (int i = 0; i < cfg_.particles; ++i)
 		parts_.push_back(std::make_unique<Particle>());
 }
@@ -114,6 +115,28 @@ int fast_policy_score(const Position& pos, Color opp, Move m) {
 }
 
 } // namespace
+
+// 特定の1手が観測と整合するかだけを確かめる。
+//
+// 部分若返り(種の先頭をそのまま再利用する)では「その手が今も整合するか」しか
+// 要らないのに、consistent_opp_moves は全合法手を生成して gives_check を全手に
+// 掛けてしまう。リプレイは1粒子あたり履歴長ぶん回るので、ここが再生成の律速だった。
+bool Belief::opp_move_consistent(const Particle& p, const HistEvent& ev, Move m, int relax) {
+	if (!p.pos.pseudo_legal_s<true>(m) || !p.pos.legal(m))
+		return false;
+	if (ev.capSq != SQ_NB) {
+		if (m.is_drop() || m.to_sq() != ev.capSq)
+			return false;
+	} else {
+		if (!m.is_drop() && p.pos.piece_on(m.to_sq()) != NO_PIECE)
+			return false;
+	}
+	if (ev.check == CheckAfter::Yes && relax < 2 && !p.pos.gives_check(m))
+		return false;
+	if (ev.check == CheckAfter::No && relax < 1 && p.pos.gives_check(m))
+		return false;
+	return true;
+}
 
 // 方策 = softmax(スコア / 温度) + ε一様。excludeの手は候補から外す。
 Move Belief::sample_policy(Particle& p, const std::vector<Move>& moves,
@@ -300,7 +323,9 @@ namespace {
 // 従来は「空きマスから一様ランダム」だったので、合成粒子は歩が敵陣最奥にいるような
 // ありえない配置を量産していた。相手の駒は平手初期配置から普通に進むだけなので、
 // 相手から見た段(relative_rank)と筋で素朴な事前分布を置くだけで大きく当たる。
-// rr は相手から見た段(0 = 相手の最奥)、rf は相手から見た筋(1 = 飛車の筋)。
+// rr は相手から見た段(0 = 相手の最奥 = 相手の玉が初期にいる段)、
+// rf は相手から見た筋(0起点で 1 = 飛車の初期筋、7 = 角の初期筋)。
+// 呼び出し側は rr に relative_rank(us, ...) を渡すこと(相手の色を渡すと段が反転する)。
 int placement_weight(PieceType raw, int rr, int rf) {
 	static const int PAWN_W  [9] = { 2,  5, 40, 26, 16,  9,  5,  3,  2};
 	static const int LANCE_W [9] = {45,  8,  8,  8,  6,  5,  4,  3,  3};
@@ -416,6 +441,10 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 		Rank r = rank_of(sq);
 		return us == BLACK ? r >= RANK_7 : r <= RANK_3;
 	};
+	// 相手陣(相手から見た1〜3段目) = synthPrior=0 のときの玉のバイアス用
+	auto in_opp_camp = [&](Square sq) {
+		return relative_rank(us, rank_of(sq)) <= RANK_3;
+	};
 	auto rel_file = [&](Square sq) {
 		int f = int(file_of(sq));
 		return opp == BLACK ? f : 8 - f;
@@ -455,8 +484,16 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 				Square sq = empties[k];
 				double w  = 0;
 				if (board[sq] == NO_PIECE && (forced == SQ_NB || sq == forced)) {
-					int rr = int(relative_rank(opp, rank_of(sq)));
-					w = double(placement_weight(raw, rr, rel_file(sq)));
+					if (cfg_.synthPrior) {
+						// 0 = 相手の最奥。relative_rank は「引数の色の最奥が8」なので、
+						// 相手から見た段は relative_rank(us, ...) のほうであることに注意
+						int rr = int(relative_rank(us, rank_of(sq)));
+						w = double(placement_weight(raw, rr, rel_file(sq)));
+					} else {
+						// 初版と同じ一様配置。玉だけは相手陣寄りに引く
+						// (初版は「相手陣でなければ70%で捨てる」= およそ3倍のバイアス)。
+						w = (raw == KING && in_opp_camp(sq)) ? 3.3 : 1.0;
+					}
 					// 演繹による減衰(強制配置のマスは演繹そのものなので掛けない)
 					if (cfg_.deduce && strictStale && forced == SQ_NB)
 						w *= stale_factor(view.stale(sq));
@@ -680,11 +717,13 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 	return nullptr;
 }
 
-void Belief::force_resynthesize(const OwnView& view) {
+void Belief::force_resynthesize(const OwnView& view, TimePoint deadline) {
 	parts_.clear();
 	int misses = 0;
 	size_t target = std::max<size_t>(16, size_t(cfg_.particles) / 4);
-	while (parts_.size() < target && misses < 400) {
+	// synthesize は1回あたり最大30試行回るので、回数だけでなく時計でも止める
+	// (sync が予算を使ったあとに呼ばれるため、ここで時間切れを起こしうる)。
+	while (parts_.size() < target && misses < 400 && now() < deadline) {
 		auto p = synthesize(view);
 		if (p)
 			parts_.push_back(std::move(p));
@@ -744,11 +783,10 @@ ParticlePtr Belief::replay_one(const GameHistory& hist, int relax,
 		case EvKind::OppMove: {
 			Move m = Move::none();
 			if (p->oppMoves.size() < reuse) {
-				// 種の再利用(整合だけ確認する)
+				// 種の再利用: その手の整合だけ直接確かめる(全合法手の列挙は不要)
 				Move sm = (*seed)[p->oppMoves.size()];
-				consistent_opp_moves(*p, ev, buf, relax);
-				for (Move c : buf)
-					if (c == sm) { m = sm; break; }
+				if (opp_move_consistent(*p, ev, sm, relax))
+					m = sm;
 			} else {
 				consistent_opp_moves(*p, ev, buf, relax);
 				if (!buf.empty()) {

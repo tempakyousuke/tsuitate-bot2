@@ -226,8 +226,12 @@ GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool v
 		IPlayer* mover = players[side];
 		IPlayer* other = players[1 - side];
 
-		mover->observe_truth(pos);
 		Move m = mover->choose();
+		// 診断は choose() のあとに取る。信念の同期・再生成は think() の中で走るので、
+		// 先に取ると「相手の直前の手をまだ反映していない粒子」を今の真の盤と
+		// 比べることになり、この変更が効かせたい経路そのものを測り損ねる。
+		// pos は自分の着手前なので、真の盤としてはここでも同じもの。
+		mover->observe_truth(pos);
 		if (m == Move::none()) {
 			stat.winner = 1 - side;
 			stat.reason = "resign";
