@@ -129,6 +129,10 @@ bool set_config_key(Config& c, const std::string& key, const std::string& val) {
 	// 意味のある範囲は高々数回。青天井にすると相手の反則を当てにした
 	// 楽観的な読み筋だけが選ばれる。
 	else if (key == "oppfoulcap")   apply_d(c.oppFoulCap, 0.0, 10.0);
+	// 相手の反則項が1つの相手ノードで動かせる評価の上限。局面評価の飽和(±2500)を
+	// 超える値を許すと、相手が反則を重ねたとき全相手ノードがクランプに張り付いて
+	// 位置評価が消える。上限は飽和の手前に留める。
+	else if (key == "oppfoulmax")   apply_d(c.oppFoulMaxCp, 0.0, 2500.0);
 	// 相手の反則1回をこちらの利得としてどれだけ評価するか(foul_valueへの倍率)。
 	// 1手の評価に効く上限は foul_value×oppFoulCap×これ なので、
 	// 詰みスコアを超えない範囲に絞る。

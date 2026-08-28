@@ -356,6 +356,13 @@ void run_arena(const ArenaOptions& opt) {
 			          << " は粒子数 " << want << " では下限 " << hardMin
 			          << " 個(=" << (100 * hardMin / (want ? want : 1))
 			          << "%)に床上げされます" << std::endl;
+		// blockcp が黙って無効化されると「効かないつまみをスイープしている」ことに
+		// 気づけない(A/Bが丸ごと無意味になる)。無効化の条件は think.cpp と揃える。
+		if (c.blockCp > 0.0 && c.oppModel > 0 && c.foulGainScale > 0.0)
+			std::cout << "info string note: p" << (k + 1) << " blockcp=" << c.blockCp
+			          << " は oppmodel=" << c.oppModel << " かつ foulgain=" << c.foulGainScale
+			          << " のとき無効化されます(相手ノードが同じ妨害の価値を数えるため)"
+			          << std::endl;
 	}
 
 	int p1Wins = 0, p2Wins = 0, draws = 0;

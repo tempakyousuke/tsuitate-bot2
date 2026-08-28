@@ -179,11 +179,20 @@ Value DSearch::opp_node(Position& pos, int depth, int ply) {
 	// 期待値ノードなのでαβ窓は使えない(どの子も重み付きで効くため打ち切れない)。
 	double expVal = 0;      // 相手視点の期待値
 	double maxVal = -1e18;  // 同じ集合の上での千里眼最善
+	// 「選んだ応手が相手の合法手を網羅していて、そのすべてが詰み」なら本物の詰み。
+	// top-k で間引いているときは網羅していないので詰みとは言えない。
+	bool  allMate    = true;
+	Value bestMateV  = -VALUE_INFINITE;  // 相手視点で最も粘れる詰み手順
+	const bool exhaustive = sel.size() == legal.size();
 	for (uint32_t i : sel) {
 		StateInfo st;
 		pos.do_move(intents[i].m, st);
 		Value v = -search(pos, depth - 1, -VALUE_INFINITE, VALUE_INFINITE, ply + 1);
 		pos.undo_move(intents[i].m);
+		if (v <= VALUE_MATED_IN_MAX_PLY)
+			bestMateV = std::max(bestMateV, v);
+		else
+			allMate = false;
 		// 「相手が3割の確率で詰みを見逃す」は大きな正の値であって詰みではない。
 		// 期待値に混ぜる前に飽和させておかないと、詰みスコアが確率で薄まった値が
 		// 詰みスコアの範囲に残って上位ノードの解釈を壊す。
@@ -192,6 +201,13 @@ Value DSearch::opp_node(Position& pos, int depth, int ply) {
 		maxVal = std::max(maxVal, s);
 	}
 
+	// 相手の合法手を全部読んで全部詰みだった = 確率モデルによらず本物の詰み。
+	// ここで詰みスコアを返さないと、深いところで見つけた詰みが下の ±2500 クランプで
+	// 「ふつうの優勢」と同点になり、最終選択の乱数タイブレークが詰みを蹴りうる。
+	// 終盤は相手の合法手が k 以下に減ることが多いので、この経路は実際に効く。
+	if (exhaustive && allMate)
+		return bestMateV;
+
 	const double lambda = std::clamp(cfg->oppLambda, 0.0, 1.0);
 	double v = (1.0 - lambda) * expVal + lambda * maxVal;
 
@@ -199,10 +215,15 @@ Value DSearch::opp_node(Position& pos, int depth, int ply) {
 	// p_ok→0 で発散するが、p_ok は手書きpriorに依存する粗い量なので上限を掛ける
 	// (青天井にすると「相手は必ず反則する」と信じ込んだ楽観的な読み筋を選ぶ)。
 	const double eFoul = std::min(cfg->oppFoulCap, (1.0 - pOk) / std::max(pOk, 1e-6));
-	v -= foulGain * eFoul;
+	// foul_value は「持ち点の1/10」のスケールで、相手の反則累計が増えると
+	// 10/(10-f) で急騰する(f=9 で 8900cp)。これをそのまま局面評価に足すと
+	// **相手が反則を重ねるほど全相手ノードが下のクランプに張り付き、
+	// 位置評価が丸ごと消える**(反則経済が勝敗を決める終盤でそうなる)。
+	// 局面評価と同じ通貨で足す以上、局面評価のレンジに収まる量に抑える必要がある。
+	v -= std::min(foulGain * eFoul, cfg->oppFoulMaxCp);
 
 	// 詰みスコアの範囲には入れない(この値は確率混合であって詰みの保証ではない)。
-	// 上の mated_in だけが本物の詰みを返す経路。
+	// 本物の詰みを返すのは上の mated_in と exhaustive&&allMate の2経路だけ。
 	return Value(int(std::clamp(v, -2500.0, 2500.0)));
 }
 

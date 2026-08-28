@@ -48,7 +48,7 @@ double fallback_score(const OwnView& view, Move m, PRNG& rng) {
 // 数え上げ、そのうち妨害になるマスに1票ずつ入れて、指したい手の総数で割る。
 // 出力は「相手の次の1手がそのマスで反則になる確率」の粒子平均。
 void block_map(const std::vector<ParticlePtr>& parts, Color us, size_t k,
-               double out[SQ_NB]) {
+               const Config& cfg, double out[SQ_NB]) {
 	for (auto sq : SQ)
 		out[sq] = 0.0;
 	k = std::min(k, parts.size());
@@ -56,59 +56,31 @@ void block_map(const std::vector<ParticlePtr>& parts, Color us, size_t k,
 		return;  // 粒子なし、または blockSamples=0(0除算でマップ全体がNaNになる)
 	const Color opp = ~us;
 	double votes[SQ_NB];
+	std::vector<OppIntent> intents;
 	for (size_t t = 0; t < k; ++t) {
 		const Position& pos = parts[t * parts.size() / k]->pos;
-		// 相手が見えている盤 = 相手自身の駒だけ(こちらの駒は見えない)
-		const Bitboard oppOcc = pos.pieces(opp);
+		// 相手の「指したい手」は探索の相手ノード(dsearch)・信念の方策と
+		// **同じ生成器**から取る。ここに独自の列挙を書くと、成り変種や
+		// 行き所のない駒の扱いが食い違って別の相手モデルになる
+		// (実際、以前はこの関数だけ成り変種と piece_can_stay を落としていた)。
+		enumerate_opp_intents(pos, opp, intents, pos.in_check(), cfg);
 		for (auto sq : SQ)
 			votes[sq] = 0.0;
 		double total = 0.0;  // 相手の「指したい手」の総数(正規化用)
 
-		// 移動手の総数(妨害できるのはスライダーの通過マスだけだが、
-		// 分母には桂・1マス駒の手も入れる)
-		Bitboard movers = oppOcc;
-		while (movers) {
-			Square from = movers.pop();
-			Piece  pc   = pos.piece_on(from);
-			// 自分の駒にぶつかるまでを「指したい手」とみなす(こちらの駒は見えない)
-			Bitboard targets = effects_from(pc, from, oppOcc) & ~oppOcc;
-			const bool slider = [&] {
-				PieceType pt = type_of(pc);
-				return pt == LANCE || pt == BISHOP || pt == ROOK || pt == HORSE || pt == DRAGON;
-			}();
-			while (targets) {
-				Square to = targets.pop();
-				total += 1.0;
-				if (!slider)
-					continue;  // 桂は飛ぶ、1マス駒は経路がない
-				Bitboard mid = between_bb(from, to);
-				while (mid)
-					votes[mid.pop()] += 1.0;
-			}
-		}
-
-		// 打ち。相手の持ち駒は粒子ごとの仮説。自分の駒のないマス全部が打ちたい候補で、
-		// そこにこちらの駒があれば打ちマス占有で反則になる。
-		Hand h = pos.hand_of(opp);
-		for (PieceType pt : {PAWN, LANCE, KNIGHT, SILVER, GOLD, BISHOP, ROOK}) {
-			if (!hand_exists(h, pt))
+		for (const auto& it : intents) {
+			total += 1.0;
+			const Move m = it.m;
+			if (m.is_drop()) {
+				// 打ちたいマスにこちらの駒があれば、打ちマス占有で反則になる
+				votes[m.to_sq()] += 1.0;
 				continue;
-			Bitboard banFiles = Bitboard(ZERO);
-			if (pt == PAWN) {
-				Bitboard pawns = pos.pieces(PAWN) & oppOcc;
-				while (pawns)
-					banFiles = banFiles | file_bb(file_of(pawns.pop()));
 			}
-			for (auto to : SQ) {
-				if (oppOcc & to)
-					continue;
-				if (!piece_can_stay(opp, pt, to))
-					continue;
-				if (pt == PAWN && (banFiles & to))
-					continue;
-				votes[to] += 1.0;
-				total     += 1.0;
-			}
+			// 妨害できるのはスライダーの通過マスだけ(桂は飛ぶ、1マス駒は経路がない)。
+			// 着地マスにいるだけなら「取られる」= 合法手なので数えない。
+			Bitboard mid = between_bb(m.from_sq(), m.to_sq());
+			while (mid)
+				votes[mid.pop()] += 1.0;
 		}
 
 		if (total <= 0.0)
@@ -253,13 +225,17 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	// 妨害マップ(相手の反則を誘う配置への加点)。合法だったときにだけ効くので
 	// p_legal を掛ける。移動元を空けるぶんは差し引く。
 	//
-	// oppModel >= 1 のときは探索の相手ノードが同じ効果を(相手の意図分布に
-	// 重み付けした正しい形で)内側で数えるので、ここでは加点しない。
-	// 両方効かせると同じ妨害を二重に数えることになる。
+	// 二重計上を避けるのは「探索の相手ノードが実際に反則の価値を数えているとき」
+	// = oppModel > 0 **かつ** foulGainScale > 0 のときだけ。
+	// foulGainScale = 0(既定)なら相手ノードは反則の価値を一切数えないので、
+	// ここで無効化すると妨害の価値がどこにも計上されなくなる。
+	// (oppModel == 1 では ply==1 の相手ノードしか modeling しないので、
+	//  それ以降の相手の手番に対する妨害の価値はそもそも数えられていない)
+	const bool oppNodeCountsFouls = cfg.oppModel > 0 && cfg.foulGainScale > 0.0;
 	std::vector<double> blockBonus(M, 0.0);
-	if (cfg.blockCp > 0.0 && cfg.oppModel == 0 && NP > 0) {
+	if (cfg.blockCp > 0.0 && !oppNodeCountsFouls && NP > 0) {
 		double map[SQ_NB];
-		block_map(parts, view.us, size_t(cfg.blockSamples), map);
+		block_map(parts, view.us, size_t(cfg.blockSamples), cfg, map);
 		for (size_t i = 0; i < M; ++i) {
 			Move m = cands[i];
 			double d = map[m.to_sq()];
