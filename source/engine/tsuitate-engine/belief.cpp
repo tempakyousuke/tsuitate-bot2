@@ -18,10 +18,21 @@ void Belief::reset(Color us, const Config& cfg) {
 	rng_ = PRNG(cfg.seed);
 	cursor_ = 0;
 	relaxLevel_ = 0;
+	relaxMean_  = 0;
 	parts_.clear();
 	graveyard_.clear();
+	curFouls_.clear();
 	for (int i = 0; i < cfg_.particles; ++i)
 		parts_.push_back(std::make_unique<Particle>());
+}
+
+double Belief::relax_mean() const {
+	if (parts_.empty())
+		return 0.0;
+	long long sum = 0;
+	for (const auto& p : parts_)
+		sum += p->relax;
+	return double(sum) / double(parts_.size());
 }
 
 void Belief::bury(const Particle& p) {
@@ -60,7 +71,84 @@ void Belief::consistent_opp_moves(const Particle& p, const HistEvent& ev,
 	}
 }
 
-// 方策 = softmax(着手後の静的評価 / 温度) + ε一様。excludeの手は候補から外す。
+namespace {
+
+// 非千里眼prior(oppPolicy=1)。
+//
+// 相手は「こちらの駒が見えない」ので、相手の着手の好みは相手自身の駒の展開だけで
+// 決まる、というモデル。実際に観測できるのは「その手が合法だった」場合だけなので、
+//   P(相手の手 | 観測) ∝ prior(手) × [その手が真の盤で合法]
+// が正しい生成モデルで、合法性フィルタは consistent_opp_moves が担う。
+//
+// 従来の千里眼モデル(着手後の静的評価のsoftmax)は「相手がこちらの駒を見て
+// 取りに来る/当たりを避ける」ことを前提にしていて、構造的にバイアスがある。
+// さらにこちらは do_move も評価関数呼び出しも不要なので桁違いに速く、
+// 粒子の再生成リプレイ(従来は一様サンプリングだった)でも同じ方策が使える。
+int fast_policy_score(const Position& pos, Color opp, Move m) {
+	// 駒種ごとの「前進したさ」(centipawn相当)
+	static const int PUSH[PIECE_TYPE_NB] = {
+		0,    // NO_PIECE_TYPE
+		110,  // PAWN
+		70,   // LANCE
+		85,   // KNIGHT
+		95,   // SILVER
+		55,   // BISHOP
+		65,   // ROOK
+		80,   // GOLD
+		-40,  // KING(前進はむしろ嫌う)
+		90, 70, 80, 85,  // PRO_PAWN, PRO_LANCE, PRO_KNIGHT, PRO_SILVER
+		70, 80,          // HORSE, DRAGON
+	};
+	const Square to = m.to_sq();
+	// 端よりは中央
+	int s = 10 * (4 - std::abs(int(file_of(to)) - int(FILE_5)));
+
+	if (m.is_drop()) {
+		// 打ちは移動手に比べて少数派。敵陣(=こちら側)への打ち込みは好まれる。
+		s -= 150;
+		if (relative_rank(opp, rank_of(to)) <= RANK_4)
+			s += 80;
+		return s;
+	}
+
+	const Square    from = m.from_sq();
+	const PieceType pt   = type_of(pos.piece_on(from));
+	// 相手から見た前進量。スライダーの大移動は「通ること」自体が稀なので頭打ちにする
+	int adv = int(relative_rank(opp, rank_of(from))) - int(relative_rank(opp, rank_of(to)));
+	adv = std::clamp(adv, -2, 3);
+	s += PUSH[pt] * adv;
+	if (m.is_promote())
+		s += 300;
+	if (pt == KING)
+		s -= 250;  // 玉はむやみに動かさない
+	return s;
+}
+
+} // namespace
+
+// 特定の1手が観測と整合するかだけを確かめる。
+//
+// 部分若返り(種の先頭をそのまま再利用する)では「その手が今も整合するか」しか
+// 要らないのに、consistent_opp_moves は全合法手を生成して gives_check を全手に
+// 掛けてしまう。リプレイは1粒子あたり履歴長ぶん回るので、ここが再生成の律速だった。
+bool Belief::opp_move_consistent(const Particle& p, const HistEvent& ev, Move m, int relax) {
+	if (!p.pos.pseudo_legal_s<true>(m) || !p.pos.legal(m))
+		return false;
+	if (ev.capSq != SQ_NB) {
+		if (m.is_drop() || m.to_sq() != ev.capSq)
+			return false;
+	} else {
+		if (!m.is_drop() && p.pos.piece_on(m.to_sq()) != NO_PIECE)
+			return false;
+	}
+	if (ev.check == CheckAfter::Yes && relax < 2 && !p.pos.gives_check(m))
+		return false;
+	if (ev.check == CheckAfter::No && relax < 1 && p.pos.gives_check(m))
+		return false;
+	return true;
+}
+
+// 方策 = softmax(スコア / 温度) + ε一様。excludeの手は候補から外す。
 Move Belief::sample_policy(Particle& p, const std::vector<Move>& moves,
                            const std::vector<Move>& exclude) {
 	std::vector<Move>  cand;
@@ -72,14 +160,19 @@ Move Belief::sample_policy(Particle& p, const std::vector<Move>& moves,
 	if (cand.size() == 1)
 		return cand[0];
 
+	const Color opp = ~us_;
 	std::vector<double> score(cand.size());
 	double mx = -1e18;
 	for (size_t i = 0; i < cand.size(); ++i) {
-		StateInfo st;
-		p.pos.do_move(cand[i], st);
-		// 着手後は手番が自分側に戻るので、相手から見た評価は符号反転
-		score[i] = -double(Eval::evaluate(p.pos));
-		p.pos.undo_move(cand[i]);
+		if (cfg_.oppPolicy != 0) {
+			score[i] = double(fast_policy_score(p.pos, opp, cand[i]));
+		} else {
+			StateInfo st;
+			p.pos.do_move(cand[i], st);
+			// 着手後は手番が自分側に戻るので、相手から見た評価は符号反転
+			score[i] = -double(Eval::evaluate(p.pos));
+			p.pos.undo_move(cand[i]);
+		}
 		mx = std::max(mx, score[i]);
 	}
 	std::vector<double> w(cand.size());
@@ -104,6 +197,7 @@ Move Belief::sample_policy(Particle& p, const std::vector<Move>& moves,
 
 ParticlePtr Belief::clone_of(const GameHistory& hist, const Particle& src) {
 	auto p = std::make_unique<Particle>();
+	p->relax = src.relax;
 	size_t k = 0;
 	for (size_t i = 0; i < cursor_; ++i) {
 		const HistEvent& ev = hist.events[i];
@@ -233,10 +327,53 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 	}
 }
 
+namespace {
+
+// 相手の駒がそのマスにいる事前確率(相対重み)。
+//
+// 従来は「空きマスから一様ランダム」だったので、合成粒子は歩が敵陣最奥にいるような
+// ありえない配置を量産していた。相手の駒は平手初期配置から普通に進むだけなので、
+// 相手から見た段(relative_rank)と筋で素朴な事前分布を置くだけで大きく当たる。
+// rr は相手から見た段(0 = 相手の最奥 = 相手の玉が初期にいる段)、
+// rf は相手から見た筋(0起点で 1 = 飛車の初期筋、7 = 角の初期筋)。
+// 呼び出し側は rr に relative_rank(us, ...) を渡すこと(相手の色を渡すと段が反転する)。
+int placement_weight(PieceType raw, int rr, int rf) {
+	static const int PAWN_W  [9] = { 2,  5, 40, 26, 16,  9,  5,  3,  2};
+	static const int LANCE_W [9] = {45,  8,  8,  8,  6,  5,  4,  3,  3};
+	static const int KNIGHT_W[9] = {40,  6, 10, 12,  8,  6,  4,  3,  3};
+	static const int SILVER_W[9] = {30, 22, 16, 10,  7,  5,  4,  3,  3};
+	static const int GOLD_W  [9] = {35, 25, 14,  8,  5,  4,  3,  2,  2};
+	static const int BISHOP_W[9] = { 6, 30, 12, 10,  8,  8,  8,  6,  6};
+	static const int ROOK_W  [9] = { 6, 32, 12, 10,  8,  8,  8,  6,  6};
+	static const int KING_W  [9] = {40, 25, 12,  8,  5,  4,  3,  2,  1};
+
+	switch (raw) {
+	case PAWN:   return PAWN_W[rr];
+	case LANCE:  return LANCE_W[rr]  * ((rf == 0 || rf == 8) ? 4 : 1);
+	case KNIGHT: return KNIGHT_W[rr] * ((rf == 1 || rf == 7) ? 3 : 1);
+	case SILVER: return SILVER_W[rr] * ((rf == 2 || rf == 6) ? 2 : 1);
+	case GOLD:   return GOLD_W[rr]   * ((rf == 3 || rf == 5) ? 2 : 1);
+	case BISHOP: return BISHOP_W[rr] * (rf == 7 ? 3 : 1);
+	case ROOK:   return ROOK_W[rr]   * (rf == 1 ? 3 : 1);
+	case KING:   return KING_W[rr]   * ((rf == 0 || rf == 8) ? 1 : 3);
+	default:     return 8;
+	}
+}
+
+// 演繹による重み係数: 「相手が指していないぶんだけ、そのマスは空いたまま」。
+// stale==0 は論理的に確実に空きなので重み0(=置かない)。
+double stale_factor(int st) {
+	static const double F[6] = {0.0, 0.25, 0.50, 0.70, 0.85, 0.95};
+	return st < 0 ? 1.0 : st < 6 ? F[st] : 1.0;
+}
+
+} // namespace
+
 // 合成粒子の生成。観測から一意に決まる駒勘定:
 //   相手の持ち駒 = 自分が失った駒(初期20枚 - 盤上の自駒)
 //   相手の盤上駒 = 相手の初期20枚 - 自分の持ち駒
-// を満たすランダム配置を作り、王手状態の整合を確認する。
+// を満たす配置を、上の事前分布と演繹(確実な空きマス・確実に相手駒がいるマス)に
+// 従ってサンプリングし、王手状態と「この手番で反則になった手」の整合を確認する。
 ParticlePtr Belief::synthesize(const OwnView& view) {
 	const Color us  = view.us;
 	const Color opp = ~us;
@@ -255,18 +392,6 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 		if (pc != NO_PIECE && type_of(pc) != KING)
 			ourOnBoard[pc & 7]++;
 	}
-	for (int pt = PAWN; pt <= GOLD; ++pt) {
-		oppTotal[pt] = totalCount[pt] - ourOnBoard[pt] - hand_count(view.hand, PieceType(pt));
-		if (oppTotal[pt] < 0)
-			return nullptr;  // 駒勘定が壊れている(観測処理のバグ)
-		int capturedAvail = std::min(view.oppCaptured[pt], oppTotal[pt]);
-		int h = 0;
-		for (int c = 0; c < capturedAvail; ++c)
-			if ((rng_.rand<uint64_t>() % 100) < 70)  // 取られた駒は7割がまだ持ち駒と仮定
-				++h;
-		oppHand[pt]  = h;
-		oppBoard[pt] = oppTotal[pt] - h;
-	}
 
 	// 空きマス(自駒のないマス)
 	std::vector<Square> empties;
@@ -274,64 +399,159 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 		if (view.board[sq] == NO_PIECE)
 			empties.push_back(sq);
 
-	const Rank oppBack[3] = {opp == WHITE ? RANK_1 : RANK_9,
-	                         opp == WHITE ? RANK_2 : RANK_8,
-	                         opp == WHITE ? RANK_3 : RANK_7};
-	auto in_opp_camp = [&](Square sq) {
-		Rank r = rank_of(sq);
-		return r == oppBack[0] || r == oppBack[1] || r == oppBack[2];
-	};
+	// 演繹: 相手が最後に自駒を取ったマスには、いま確実に相手の駒がいる
+	// (それ以降に動いたのは自分の駒だけで、取り返していれば自駒が乗っている)。
+	Square forcedSq = SQ_NB;
+	if (cfg_.deduce && view.lastOppCaptureSq != SQ_NB
+	    && view.board[view.lastOppCaptureSq] == NO_PIECE)
+		forcedSq = view.lastOppCaptureSq;
+
+	// 演繹: この手番で反則になった手から「相手駒がいるマス」を割り出す。
+	// 合成粒子は最後に curFouls_ との整合を棄却検査するが、ランダム配置が
+	// 偶然そこを埋める確率は低いので、能動的に置いて採択率を上げる。
+	//
+	//   打ちの反則 … 打ちは自駒を動かさないので自玉を晒すことはない。王手中でなく
+	//     歩打ち(打ち歩詰めの可能性)でもなければ、着地マスが埋まっている以外に
+	//     反則の理由がない ⇒ そのマスに相手駒がいる(確実)
+	//   スライダー移動の反則 … 経路のどこかが埋まっている(ピンの可能性もあるので
+	//     確実ではないが、経路封鎖のほうが圧倒的に多い)。経路から1マス選んで置く
+	std::vector<Square> forcedExtra;
+	if (cfg_.deduce && !view.inCheckNow) {
+		for (Move fm : curFouls_) {
+			Square sq = SQ_NB;
+			if (fm.is_drop()) {
+				if (fm.move_dropped_piece() == PAWN)
+					continue;  // 打ち歩詰めなら着地マスは空でも反則になる
+				sq = fm.to_sq();
+			} else {
+				// 経路(両端を除く)からランダムに1マス
+				std::vector<Square> path;
+				Square from = fm.from_sq(), to = fm.to_sq();
+				int df = int(file_of(to)) - int(file_of(from));
+				int dr = int(rank_of(to)) - int(rank_of(from));
+				int steps = std::max(std::abs(df), std::abs(dr));
+				if (steps >= 2 && (df == 0 || dr == 0 || std::abs(df) == std::abs(dr))) {
+					int sf = (df > 0) - (df < 0), sr = (dr > 0) - (dr < 0);
+					for (int k = 1; k < steps; ++k) {
+						Square t = File(int(file_of(from)) + sf * k) | Rank(int(rank_of(from)) + sr * k);
+						if (view.board[t] == NO_PIECE)
+							path.push_back(t);
+					}
+				}
+				if (!path.empty() && (rng_.rand<uint64_t>() % 100) < 65)
+					sq = path[rng_.rand<uint64_t>() % path.size()];
+			}
+			if (sq == SQ_NB || view.board[sq] != NO_PIECE || sq == forcedSq)
+				continue;
+			if (std::find(forcedExtra.begin(), forcedExtra.end(), sq) == forcedExtra.end())
+				forcedExtra.push_back(sq);
+		}
+	}
+
 	auto in_our_camp = [&](Square sq) {
 		Rank r = rank_of(sq);
 		return us == BLACK ? r >= RANK_7 : r <= RANK_3;
 	};
+	// 相手陣(相手から見た1〜3段目) = synthPrior=0 のときの玉のバイアス用
+	auto in_opp_camp = [&](Square sq) {
+		return relative_rank(us, rank_of(sq)) <= RANK_3;
+	};
+	auto rel_file = [&](Square sq) {
+		int f = int(file_of(sq));
+		return opp == BLACK ? f : 8 - f;
+	};
 
 	for (int attempt = 0; attempt < 30; ++attempt) {
-		// 配置(シャッフルして先頭から使う)
-		std::vector<Square> pool = empties;
-		for (size_t i = pool.size(); i > 1; --i)
-			std::swap(pool[i - 1], pool[rng_.rand<uint64_t>() % i]);
+		// 後半の試行では演繹の重みを緩める(駒勘定の推定ずれで詰むのを防ぐ)
+		const bool strictStale = attempt < 20;
+
+		for (int pt = PAWN; pt <= GOLD; ++pt) {
+			oppTotal[pt] = totalCount[pt] - ourOnBoard[pt] - hand_count(view.hand, PieceType(pt));
+			if (oppTotal[pt] < 0)
+				return nullptr;  // 駒勘定が壊れている(観測処理のバグ)
+			int capturedAvail = std::min(view.oppCaptured[pt], oppTotal[pt]);
+			int h = 0;
+			for (int c = 0; c < capturedAvail; ++c)
+				if ((rng_.rand<uint64_t>() % 100) < 70)  // 取られた駒は7割がまだ持ち駒と仮定
+					++h;
+			oppHand[pt]  = h;
+			oppBoard[pt] = oppTotal[pt] - h;
+		}
 
 		Piece board[SQ_NB];
 		for (auto sq : SQ)
 			board[sq] = view.board[sq];
 		bool pawnFile[FILE_NB] = {};
-		size_t poolIdx = 0;
 		bool ok = true;
 
-		auto place = [&](PieceType raw) -> bool {
-			// 玉は相手陣を優先
-			for (size_t k = poolIdx; k < pool.size(); ++k) {
-				Square sq = pool[k];
-				// 玉の相手陣バイアス: 序盤の玉は動いていないことが多い
-				if (raw == KING && !in_opp_camp(sq)
-				    && (rng_.rand<uint64_t>() % 100) < 70)
-					continue;
-				// 成りの決定(相手から見た敵陣=自陣側にあるなら成りやすい)
-				bool promoted = false;
-				if (raw != KING && raw != GOLD) {
-					int pr = in_our_camp(sq) ? 25 : 2;
-					promoted = (rng_.rand<uint64_t>() % 100) < uint64_t(pr);
+		// 事前分布に従って空きマスを1つ選び、駒を置く。
+		// forced が指定されていればそのマスに固定する(演繹による強制配置)。
+		auto place = [&](PieceType raw, Square forced) -> bool {
+			// 不成/成りの候補ごとに重みを積む
+			double     total = 0;
+			double     wbuf[81];
+			size_t     n = empties.size();
+			for (size_t k = 0; k < n; ++k) {
+				Square sq = empties[k];
+				double w  = 0;
+				if (board[sq] == NO_PIECE && (forced == SQ_NB || sq == forced)) {
+					if (cfg_.synthPrior) {
+						// 0 = 相手の最奥。relative_rank は「引数の色の最奥が8」なので、
+						// 相手から見た段は relative_rank(us, ...) のほうであることに注意
+						int rr = int(relative_rank(us, rank_of(sq)));
+						w = double(placement_weight(raw, rr, rel_file(sq)));
+					} else {
+						// 初版と同じ一様配置。玉だけは相手陣寄りに引く
+						// (初版は「相手陣でなければ70%で捨てる」= およそ3倍のバイアス)。
+						w = (raw == KING && in_opp_camp(sq)) ? 3.3 : 1.0;
+					}
+					// 演繹による減衰(強制配置のマスは演繹そのものなので掛けない)
+					if (cfg_.deduce && strictStale && forced == SQ_NB)
+						w *= stale_factor(view.stale(sq));
+					// 二歩になる筋は「と金なら置ける」ので、重み0にはしない。
+					// 0にすると後段の「二歩なら成りに倒す」が死にコードになり、
+					// 相手の生歩が空き筋より多いとき(と金が要るとき)に
+					// place(PAWN) が必ず失敗して合成粒子が作れなくなる。
+					if (raw == PAWN && pawnFile[file_of(sq)])
+						w *= 0.15;
 				}
-				if (!promoted && raw == PAWN) {
-					if (pawnFile[file_of(sq)])
-						continue;
-					if (!piece_can_stay(opp, PAWN, sq))
-						continue;
-				}
-				if (!promoted && raw == LANCE && !piece_can_stay(opp, LANCE, sq))
-					continue;
-				if (!promoted && raw == KNIGHT && !piece_can_stay(opp, KNIGHT, sq))
-					continue;
-				Piece pc = make_piece(opp, promoted ? PieceType(raw | 8) : raw);
-				board[sq] = pc;
-				if (!promoted && raw == PAWN)
-					pawnFile[file_of(sq)] = true;
-				std::swap(pool[k], pool[poolIdx]);
-				++poolIdx;
-				return true;
+				wbuf[k] = w;
+				total += w;
 			}
-			return false;
+			if (total <= 0)
+				return false;
+			double r    = double(rng_.rand<uint64_t>() >> 11) / double(1ull << 53) * total;
+			size_t pick = SIZE_MAX;
+			double acc  = 0;
+			for (size_t k = 0; k < n; ++k) {
+				if (wbuf[k] <= 0)
+					continue;
+				pick = k;              // 最後に見た正の重み(丸め誤差時のフォールバック)
+				acc += wbuf[k];
+				if (r <= acc)
+					break;
+			}
+			if (pick == SIZE_MAX)
+				return false;
+			Square sq = empties[pick];
+
+			// 成りの決定(相手から見た敵陣=自陣側にあるなら成りやすい)
+			bool promoted = false;
+			if (raw != KING && raw != GOLD) {
+				int pr = in_our_camp(sq) ? 25 : 2;
+				promoted = (rng_.rand<uint64_t>() % 100) < uint64_t(pr);
+				// 不成では存在できないマス(行き所のない駒)は強制成り
+				if (!promoted && !piece_can_stay(opp, raw, sq))
+					promoted = raw == PAWN || raw == LANCE || raw == KNIGHT;
+				if (!promoted && raw == PAWN && pawnFile[file_of(sq)])
+					promoted = true;
+			}
+			if (!promoted && !piece_can_stay(opp, raw, sq))
+				return false;
+			board[sq] = make_piece(opp, promoted ? PieceType(raw | 8) : raw);
+			if (!promoted && raw == PAWN)
+				pawnFile[file_of(sq)] = true;
+			return true;
 		};
 
 		// 王手を受けているときは、王手をかけている駒を最後に明示的に置く
@@ -347,12 +567,50 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 			checkerRaw = avail[rng_.rand<uint64_t>() % avail.size()];
 		}
 
-		if (!place(KING))
+		// 演繹による強制配置(相手が最後に取ったマス)。
+		// 王手中なら王手駒がそこにいる可能性が高いので、そちらの配置に任せる。
+		PieceType forcedRaw = NO_PIECE_TYPE;
+		if (forcedSq != SQ_NB && !(view.inCheckNow)) {
+			std::vector<PieceType> avail;
+			for (int pt = PAWN; pt <= GOLD; ++pt)
+				if (oppBoard[pt] > 0)
+					avail.push_back(PieceType(pt));
+			if (!avail.empty())
+				forcedRaw = avail[rng_.rand<uint64_t>() % avail.size()];
+		}
+
+		// 演繹で決まっているマスを先に埋める。玉を先に置くと、玉がたまたま
+		// 強制配置のマスに乗ってしまい、そのあとの place(forced) が必ず失敗して
+		// 30試行のうち1枠を丸ごと捨てることになる(玉の置き場所は60マス以上あるので、
+		// 先に強制配置を埋めても玉が置けなくなることはまずない)。
+		if (forcedRaw != NO_PIECE_TYPE) {
+			if (!place(forcedRaw, forcedSq))
+				continue;
+			oppBoard[forcedRaw]--;
+		}
+		// 反則から割り出したマスを埋める(駒種は盤上に残っているものからランダム)
+		for (Square fs : forcedExtra) {
+			std::vector<PieceType> avail;
+			for (int pt = PAWN; pt <= GOLD; ++pt)
+				if (oppBoard[pt] - (checkerRaw == pt ? 1 : 0) > 0)
+					avail.push_back(PieceType(pt));
+			if (avail.empty())
+				break;
+			PieceType raw = avail[rng_.rand<uint64_t>() % avail.size()];
+			if (!place(raw, fs)) {
+				ok = false;
+				break;
+			}
+			oppBoard[raw]--;
+		}
+		if (!ok)
+			continue;
+		if (!place(KING, SQ_NB))
 			continue;
 		for (int pt = PAWN; pt <= GOLD && ok; ++pt) {
 			int cnt = oppBoard[pt] - (checkerRaw == pt ? 1 : 0);
 			for (int c = 0; c < cnt && ok; ++c)
-				ok = place(PieceType(pt));
+				ok = place(PieceType(pt), SQ_NB);
 		}
 		if (!ok)
 			continue;
@@ -465,23 +723,40 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 		Square oppKing = p->pos.square<KING>(opp);
 		if (p->pos.attackers_to(us, oppKing))
 			continue;
+		// 演繹: この手番ですでに反則になった手は、真の局面では必ず不正。
+		// 合成粒子でそれが合法になっているなら、その配置は真の局面ではありえない。
+		bool contradicted = false;
+		for (Move fm : curFouls_)
+			if (p->legal(fm)) { contradicted = true; break; }
+		if (contradicted)
+			continue;
 		return p;
 	}
 	return nullptr;
 }
 
-void Belief::force_resynthesize(const OwnView& view) {
+void Belief::force_resynthesize(const OwnView& view, TimePoint deadline) {
 	parts_.clear();
 	int misses = 0;
-	size_t target = std::max<size_t>(16, size_t(cfg_.particles) / 4);
+	// particles を小さくしたときに設定値を超えて作らないよう頭打ちにする
+	size_t target = std::min(size_t(cfg_.particles),
+	                         std::max<size_t>(16, size_t(cfg_.particles) / 4));
+	// synthesize は1回あたり最大30試行回るので、回数だけでなく時計でも止める
+	// (sync が予算を使ったあとに呼ばれるため、ここで時間切れを起こしうる)。
 	while (parts_.size() < target && misses < 400) {
+		// 締め切りを過ぎていても、1粒子も作れていないうちは少しだけ粘る
+		// (空の信念で戻ると呼び出し側が手を選べなくなる)。ただし無制限にはしない
+		// ―― 粘る回数を絞らないと 400ミス×30試行ぶん予算を食い潰しうる。
+		if (now() >= deadline && (!parts_.empty() || misses >= 40))
+			break;
 		auto p = synthesize(view);
 		if (p)
 			parts_.push_back(std::move(p));
 		else
 			++misses;
 	}
-	relaxLevel_ = 3;
+	relaxMean_  = relax_mean();
+	relaxLevel_ = int(relaxMean_ + 0.5);
 }
 
 ParticlePtr Belief::replay_one(const GameHistory& hist, int relax,
@@ -534,16 +809,20 @@ ParticlePtr Belief::replay_one(const GameHistory& hist, int relax,
 		case EvKind::OppMove: {
 			Move m = Move::none();
 			if (p->oppMoves.size() < reuse) {
-				// 種の再利用(整合だけ確認する)
+				// 種の再利用: その手の整合だけ直接確かめる(全合法手の列挙は不要)
 				Move sm = (*seed)[p->oppMoves.size()];
-				consistent_opp_moves(*p, ev, buf, relax);
-				for (Move c : buf)
-					if (c == sm) { m = sm; break; }
+				if (opp_move_consistent(*p, ev, sm, relax))
+					m = sm;
 			} else {
 				consistent_opp_moves(*p, ev, buf, relax);
-				if (!buf.empty())
-					// リプレイは回数が多いので評価なしの一様サンプリング
-					m = buf[rng_.rand<uint64_t>() % buf.size()];
+				if (!buf.empty()) {
+					// oppPolicy=1 の非千里眼priorは評価関数を呼ばないので、
+					// 回数の多いリプレイでもフィルタと同じ方策が使える。
+					// (従来は一様サンプリングで、フィルタとリプレイで相手モデルが
+					//  食い違っていた ＝ 再生成した粒子だけ相手の指し手がでたらめ)
+					m = cfg_.oppPolicy != 0 ? sample_policy(*p, buf, {})
+					                        : buf[rng_.rand<uint64_t>() % buf.size()];
+				}
 			}
 			if (m == Move::none())
 				return nullptr;
@@ -553,10 +832,22 @@ ParticlePtr Belief::replay_one(const GameHistory& hist, int relax,
 		}
 		}
 	}
+	p->relax = relax;
 	return p;
 }
 
 void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadline) {
+	// この手番でこれまでに反則になった自分の手を拾う(履歴末尾の OurFoul の連なり)。
+	// 「現局面でこの手は不正」は演繹的に確実な制約なので、合成粒子の棄却に使う。
+	curFouls_.clear();
+	if (cfg_.deduce)
+		for (auto it = hist.events.rbegin(); it != hist.events.rend(); ++it) {
+			if (it->kind == EvKind::OurFoul)
+				curFouls_.push_back(it->move);
+			else if (it->kind == EvKind::OurMove || it->kind == EvKind::OppMove)
+				break;
+		}
+
 	// 王手宣言が確定しているイベントまで適用
 	while (cursor_ < hist.events.size()) {
 		const HistEvent& ev = hist.events[cursor_];
@@ -571,10 +862,25 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 	// 緩和(relax>0)した粒子は観測と部分的に矛盾していて合法率の推定を汚すので、
 	// 目標数(want)へは厳密粒子のみで向かい、緩和は「最低限の粒子数(hardMin)の
 	// 確保」のためだけに使う。
-	size_t want    = size_t(cfg_.particles);
-	size_t hardMin = std::max<size_t>(8, want / 16);
-	if (parts_.size() >= want / 2)
+	size_t want = size_t(cfg_.particles);
+	// 最低限確保したい粒子数。want 自体を超えないよう頭打ちにすること
+	//(particles は1まで設定できるので、max(8, want/16) だけだと want < 8 のとき
+	// 「絶対に満たせない下限」になり、毎手ラダーを空回りさせたうえで
+	// 合成粒子だけの信念(relaxLevel_=3 固定)に落ちてしまう)。
+	size_t hardMin = std::min(want, std::max<size_t>(8, want / 16));
+	// regenFloorPct は「これだけ粒子が残っていれば再生成を省く」閾値だが、
+	// 低い値にすると再生成ラダーだけでなく最後の合成粒子フォールバックまで
+	// 素通りしてしまい、粒子ゼロで思考する手番が量産される
+	// (regenfloor 0 の実測: zero_particle 65/101、avg_p_legal 31%)。
+	// hardMin を下回っているときは閾値に関係なく必ず作り直す。
+	if (parts_.size() >= std::max(hardMin, want * size_t(cfg_.regenFloorPct) / 100)) {
+		// 再生成しなくても品質は必ず測り直す。ここを素通りすると前の手番の
+		// relaxLevel_(最悪3=合成)が残り、think() の反則コスト割増が
+		// 「いまは厳密な粒子しかない手番」にも掛かってしまう。
+		relaxMean_  = relax_mean();
+		relaxLevel_ = int(relaxMean_ + 0.5);
 		return;
+	}
 
 	// 時間配分: 厳密(relax=0)に50%、relax=1に25%、relax=2に残り。
 	// 失敗回数でも時間でも先に尽きたほうでエスカレーションする。
@@ -635,7 +941,8 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 			failKind_[size_t(hist.events[failIdx].kind)]++;
 		}
 	}
-	relaxLevel_ = relax;
+	relaxMean_  = relax_mean();
+	relaxLevel_ = int(relaxMean_ + 0.5);
 
 	// 最終フォールバック: 合成粒子(常に成功する)。
 	// リプレイでは再現できない稀な相手の指し回しに遭遇したときの保険で、
@@ -650,8 +957,8 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 			else
 				++misses;
 		}
-		if (!parts_.empty())
-			relaxLevel_ = 3;
+		relaxMean_  = relax_mean();
+		relaxLevel_ = int(relaxMean_ + 0.5);
 	}
 
 	if (parts_.empty() && cfg_.logLevel >= 1) {

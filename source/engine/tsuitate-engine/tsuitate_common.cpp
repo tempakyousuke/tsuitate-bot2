@@ -3,6 +3,9 @@
 
 #if defined(TSUITATE_ENGINE)
 
+#include <algorithm>
+#include <cmath>
+
 #include "../../bitboard.h"
 
 namespace YaneuraOu {
@@ -12,6 +15,29 @@ namespace Tsuitate {
 // OwnView
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// from と to の間のマス(両端を含まない)。飛角香の経路。
+// 直線上にない(桂・玉など)なら空。
+std::vector<Square> between_squares(Square from, Square to) {
+	std::vector<Square> out;
+	int df = int(file_of(to)) - int(file_of(from));
+	int dr = int(rank_of(to)) - int(rank_of(from));
+	int steps = std::max(std::abs(df), std::abs(dr));
+	if (steps <= 1)
+		return out;
+	// 直線(縦・横・斜め)でなければ経路はない
+	if (!(df == 0 || dr == 0 || std::abs(df) == std::abs(dr)))
+		return out;
+	int sf = (df > 0) - (df < 0);
+	int sr = (dr > 0) - (dr < 0);
+	for (int k = 1; k < steps; ++k)
+		out.push_back(File(int(file_of(from)) + sf * k) | Rank(int(rank_of(from)) + sr * k));
+	return out;
+}
+
+} // namespace
+
 void OwnView::reset(Color us_) {
 	us = us_;
 	for (auto sq : SQ)
@@ -19,6 +45,25 @@ void OwnView::reset(Color us_) {
 	hand = HAND_ZERO;
 	ourFouls = oppFouls = 0;
 	inCheckNow = false;
+	lastOppCaptureSq = SQ_NB;
+	for (int i = 0; i < 8; ++i)
+		oppCaptured[i] = 0;
+
+	// 演繹の初期状態: 平手初期局面は相手の配置も完全に既知なので、
+	// 相手駒のないマスは全部「確実に空き(陳腐化度0)」から始まる。
+	// 相手陣は相手から見て1段目(全筋)・2段目(2筋と8筋の角飛)・3段目(全筋の歩)。
+	//
+	// 段の向きに注意: relative_rank(c, r) は「cの最奥が8」なので、
+	// 「相手から見た段」が欲しいときに引くのは relative_rank(opp, r) ではなく
+	// relative_rank(us, r) のほう(us の最奥 = 8 = 相手から見て9段目)。
+	oppMoveCount = 0;
+	for (auto sq : SQ) {
+		Rank rr = relative_rank(us, rank_of(sq));  // 0 = 相手の最奥
+		File f  = file_of(sq);
+		bool oppPiece = (rr == RANK_1) || (rr == RANK_3)
+		                || (rr == RANK_2 && (f == FILE_2 || f == FILE_8));
+		emptyStamp[sq] = oppPiece ? -9999 : 0;
+	}
 
 	// 平手初期配置の自分側だけを置く。
 	// 先手(BLACK)基準で並べ、後手ならInv()で180度回転する。
@@ -43,10 +88,18 @@ void OwnView::apply_our_move(Move m, PieceType capRole) {
 	if (m.is_drop()) {
 		PieceType pt = m.move_dropped_piece();
 		sub_hand(hand, pt);
-		board[m.to_sq()] = make_piece(us, pt);
+		Square to = m.to_sq();
+		// 打てた = 着地マスは空いていた
+		emptyStamp[to] = oppMoveCount;
+		board[to] = make_piece(us, pt);
 	} else {
 		Square from = m.from_sq(), to = m.to_sq();
 		Piece  pc   = board[from];
+		// 通れた = 経路の通過マスは空いていた。移動元も自駒が退いただけで空き。
+		emptyStamp[from] = oppMoveCount;
+		emptyStamp[to]   = oppMoveCount;
+		for (Square s : between_squares(from, to))
+			emptyStamp[s] = oppMoveCount;
 		board[from] = NO_PIECE;
 		if (m.is_promote())
 			pc = Piece(pc | PIECE_PROMOTE);
@@ -57,6 +110,8 @@ void OwnView::apply_our_move(Move m, PieceType capRole) {
 }
 
 void OwnView::apply_opp_capture(Square capSq) {
+	// 相手が1手指した = 空き情報がすべて1手ぶん古くなる
+	++oppMoveCount;
 	lastOppCaptureSq = capSq;
 	if (capSq == SQ_NB)
 		return;
@@ -64,6 +119,13 @@ void OwnView::apply_opp_capture(Square capSq) {
 	if (pc != NO_PIECE && type_of(pc) != KING)
 		oppCaptured[pc & 7]++;
 	board[capSq] = NO_PIECE;
+	// 取られたマスには「取った相手の駒」が乗っている。ここを刻み直さないと、
+	// 直前まで自駒がいたせいで emptyStamp が新しいまま
+	//(= 陳腐化度が小さい = まだ空きらしい)になり、
+	// 相手駒が確実にいるマスの重みを下げるという逆向きの演繹になってしまう。
+	// 最新の1マスは synthesize の強制配置(forcedSq)が拾うが、
+	// それ以前に取られたマスはここで「空きとは分かっていない」に戻しておく。
+	emptyStamp[capSq] = -9999;
 }
 
 Bitboard OwnView::occupied() const {

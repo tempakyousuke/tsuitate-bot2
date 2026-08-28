@@ -24,7 +24,8 @@ struct ThinkResult {
 	double      pLegal = 0;
 	double      expectedCp = 0;
 	size_t      nParticles = 0;
-	int         relaxLevel = 0;
+	int         relaxLevel = 0;   // 診断表示用(0..3)
+	double      relaxMean = 0;    // 反則コスト割増に使う連続値
 	int         depthReached = 0;
 	TimePoint   elapsedMs = 0;
 };

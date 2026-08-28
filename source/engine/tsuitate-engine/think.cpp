@@ -8,6 +8,7 @@
 #include <cmath>
 
 #include "../../evaluate.h"
+#include "../../bitboard.h"
 
 namespace YaneuraOu {
 namespace Tsuitate {
@@ -35,6 +36,92 @@ double fallback_score(const OwnView& view, Move m, PRNG& rng) {
 	return s;
 }
 
+// 相手の反則を誘うマスの重み(妨害マップ)。
+//
+// ついたて将棋の勝敗は実質「反則予算10回の消耗戦」なので、相手に反則をさせること
+// 自体に価値がある。相手はこちらの駒が見えないから、こちらの駒が
+//   - スライダーの**通過マス**にいる    → 経路封鎖で反則
+//   - 打ちたいマスにいる                → 打ちマス占有で反則
+// になる。着地マスにいるだけなら「取られる」(合法手)ので数えない。
+//
+// 粒子上の相手の駒・持ち駒から「相手が(こちらの駒を無視して)指したい手」を
+// 数え上げ、そのうち妨害になるマスに1票ずつ入れて、指したい手の総数で割る。
+// 出力は「相手の次の1手がそのマスで反則になる確率」の粒子平均。
+void block_map(const std::vector<ParticlePtr>& parts, Color us, size_t k,
+               double out[SQ_NB]) {
+	for (auto sq : SQ)
+		out[sq] = 0.0;
+	k = std::min(k, parts.size());
+	if (k == 0)
+		return;  // 粒子なし、または blockSamples=0(0除算でマップ全体がNaNになる)
+	const Color opp = ~us;
+	double votes[SQ_NB];
+	for (size_t t = 0; t < k; ++t) {
+		const Position& pos = parts[t * parts.size() / k]->pos;
+		// 相手が見えている盤 = 相手自身の駒だけ(こちらの駒は見えない)
+		const Bitboard oppOcc = pos.pieces(opp);
+		for (auto sq : SQ)
+			votes[sq] = 0.0;
+		double total = 0.0;  // 相手の「指したい手」の総数(正規化用)
+
+		// 移動手の総数(妨害できるのはスライダーの通過マスだけだが、
+		// 分母には桂・1マス駒の手も入れる)
+		Bitboard movers = oppOcc;
+		while (movers) {
+			Square from = movers.pop();
+			Piece  pc   = pos.piece_on(from);
+			// 自分の駒にぶつかるまでを「指したい手」とみなす(こちらの駒は見えない)
+			Bitboard targets = effects_from(pc, from, oppOcc) & ~oppOcc;
+			const bool slider = [&] {
+				PieceType pt = type_of(pc);
+				return pt == LANCE || pt == BISHOP || pt == ROOK || pt == HORSE || pt == DRAGON;
+			}();
+			while (targets) {
+				Square to = targets.pop();
+				total += 1.0;
+				if (!slider)
+					continue;  // 桂は飛ぶ、1マス駒は経路がない
+				Bitboard mid = between_bb(from, to);
+				while (mid)
+					votes[mid.pop()] += 1.0;
+			}
+		}
+
+		// 打ち。相手の持ち駒は粒子ごとの仮説。自分の駒のないマス全部が打ちたい候補で、
+		// そこにこちらの駒があれば打ちマス占有で反則になる。
+		Hand h = pos.hand_of(opp);
+		for (PieceType pt : {PAWN, LANCE, KNIGHT, SILVER, GOLD, BISHOP, ROOK}) {
+			if (!hand_exists(h, pt))
+				continue;
+			Bitboard banFiles = Bitboard(ZERO);
+			if (pt == PAWN) {
+				Bitboard pawns = pos.pieces(PAWN) & oppOcc;
+				while (pawns)
+					banFiles = banFiles | file_bb(file_of(pawns.pop()));
+			}
+			for (auto to : SQ) {
+				if (oppOcc & to)
+					continue;
+				if (!piece_can_stay(opp, pt, to))
+					continue;
+				if (pt == PAWN && (banFiles & to))
+					continue;
+				votes[to] += 1.0;
+				total     += 1.0;
+			}
+		}
+
+		if (total <= 0.0)
+			continue;
+		const double inv = 1.0 / total;
+		for (auto sq : SQ)
+			out[sq] += votes[sq] * inv;
+	}
+	const double invK = 1.0 / double(k);
+	for (auto sq : SQ)
+		out[sq] *= invK;
+}
+
 } // namespace
 
 ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistory& hist,
@@ -44,8 +131,8 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	const TimePoint deadline = t0 + budgetMs;
 	ThinkResult res;
 
-	// 1) 信念の同期(再生成には予算の40%まで使う)
-	belief.sync(hist, view, t0 + budgetMs * 2 / 5);
+	// 1) 信念の同期(再生成には予算の cfg.syncPct% まで使う)
+	belief.sync(hist, view, t0 + budgetMs * cfg.syncPct / 100);
 	res.nParticles = belief.size();
 	res.relaxLevel = belief.relaxLevel();
 
@@ -60,8 +147,9 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	const auto& parts = belief.particles();
 	const size_t N    = parts.size();
 
-	// 粒子ゼロ: ヒューリスティックで指す(それでも投了よりまし)
-	if (N == 0) {
+	// 粒子ゼロ: ヒューリスティックで指す(それでも投了よりまし)。
+	// 信念の破産処理(下)が作り直しに失敗した直後にも使う。
+	auto heuristic_pick = [&]() {
 		double best = -1e18;
 		for (Move m : cands) {
 			double s = fallback_score(view, m, rng);
@@ -69,7 +157,9 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		}
 		res.elapsedMs = now() - t0;
 		return res;
-	}
+	};
+	if (N == 0)
+		return heuristic_pick();
 
 	// 3) 合法率と「合法な粒子のindex」を全候補について求める
 	size_t M = cands.size();
@@ -93,9 +183,20 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		for (size_t i = 0; i < M; ++i)
 			maxLegal = std::max(maxLegal, legalIdx[i].size());
 		if (maxLegal == 0) {
-			belief.force_resynthesize(view);
+			// sync が予算の syncPct% を使ったあと。作り直しにも同じだけ上限を与える。
+			// sync は締め切りを最大100ms超過しうるので、ここで既に過去の時刻に
+			// なっていることがある。最低限の時間は必ず与える(でないと1粒子も
+			// 作らずに空の信念で先へ進んでしまう)。
+			TimePoint reDeadline = std::min(now() + budgetMs * cfg.syncPct / 100,
+			                                deadline - 50);
+			belief.force_resynthesize(view, std::max(reDeadline, now() + 20));
 			res.nParticles = belief.size();
 			res.relaxLevel = belief.relaxLevel();
+			// 作り直しにも失敗した(合成粒子が1つも作れない)。
+			// このまま進むと全候補の評価が反則コストで並んで選択が無意味になるので、
+			// 「見えない駒に当たりにくい手」のヒューリスティックに委ねる。
+			if (belief.particles().empty())
+				return heuristic_pick();
 			scan_legality();
 		}
 	}
@@ -122,20 +223,45 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		// 下の「合法粒子ゼロでも評価」経路(ヒューリスティック相当)に任せる。
 	}
 
-	auto p_legal = [&](size_t i) { return double(legalIdx[i].size()) / double(NP); };
+	// 合法率。cfg.pLegalPrior > 0 なら弱い事前分布へシュリンクする
+	// (粒子は複製で相関しているので、素の頻度は自信過剰になりやすい)。
+	const double prA = cfg.pLegalPrior * cfg.pLegalPriorMean;
+	const double prB = cfg.pLegalPrior * (1.0 - cfg.pLegalPriorMean);
+	auto p_legal = [&](size_t i) {
+		return (double(legalIdx[i].size()) + prA) / (double(NP) + prA + prB);
+	};
 
 	// 反則コスト(centipawn)。累計10回で反則負けなので、残り予算が減るほど急騰させる。
 	double remain = std::max(1.0, 10.0 - view.ourFouls);
 	double foulCp = -(cfg.foulBaseCp + cfg.foulStepCp * view.ourFouls) * (10.0 / remain);
+	// 相手が反則負けに近い = こちらが勝勢。勝ちを守るためリスクをさらに嫌う。
+	foulCp *= 1.0 + cfg.foulOppW * view.oppFouls;
 	// 信念の品質が悪い(緩和粒子・粒子不足)ときはp_legalの推定が信用できないので、
 	// リスクをさらに重く見る。反則→粒子死→さらに反則、のスパイラルを断つ。
-	foulCp *= 1.0 + 1.5 * belief.relaxLevel();
+	// 緩和度は粒子集合の平均(連続値)。整数レベルで掛けると、
+	// 粒子の入れ替わりで境界をまたいだだけで割増が飛んでしまう。
+	foulCp *= 1.0 + 1.5 * belief.relaxMean();
 	if (NP * 4 < size_t(cfg.particles))
 		foulCp *= 2.0;
 
+	// 妨害マップ(相手の反則を誘う配置への加点)。合法だったときにだけ効くので
+	// p_legal を掛ける。移動元を空けるぶんは差し引く。
+	std::vector<double> blockBonus(M, 0.0);
+	if (cfg.blockCp > 0.0 && NP > 0) {
+		double map[SQ_NB];
+		block_map(parts, view.us, size_t(cfg.blockSamples), map);
+		for (size_t i = 0; i < M; ++i) {
+			Move m = cands[i];
+			double d = map[m.to_sq()];
+			if (!m.is_drop())
+				d -= map[m.from_sq()];
+			blockBonus[i] = cfg.blockCp * d;
+		}
+	}
+
 	auto combined = [&](size_t i, double meanCp) {
 		double pl = p_legal(i);
-		return pl * meanCp + (1.0 - pl) * foulCp;
+		return pl * (meanCp + blockBonus[i]) + (1.0 - pl) * foulCp;
 	};
 
 	// 均等間隔で粒子を選ぶ(粒子は生成順に相関があるため)
