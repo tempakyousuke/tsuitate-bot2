@@ -120,7 +120,7 @@ TSUITATE_URL=http://localhost:5199 TSUITATE_BOT_TOKEN=tsb_b npm start &
 
 ## 設計の要点
 
-詳細は [docs/design.md](docs/design.md)。
+詳細は [docs/design.md](docs/design.md)。次版に向けた強化設計は [docs/strengthening.md](docs/strengthening.md)。
 
 - **観測**: 自分の反則(理由なし)・取った/取られた駒・王手宣言だけが入力。
   相手の指し手は一切見えない(サーバー側で構造的に保証)
