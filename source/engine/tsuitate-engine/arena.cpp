@@ -193,7 +193,7 @@ std::unique_ptr<IPlayer> make_player(const std::string& kind, const ArenaOptions
 	if (kind == "belief") {
 		Config c = slot == 0 ? opt.cfg : opt.cfg2;
 		c.seed   = seed;
-		return std::make_unique<BeliefPlayer>(c, opt.budgetMs, slot);
+		return std::make_unique<BeliefPlayer>(c, c.budgetMs, slot);
 	}
 	return std::make_unique<HeuristicPlayer>(seed);
 }
@@ -216,6 +216,10 @@ GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool v
 	sente.new_game(BLACK);
 	gote.new_game(WHITE);
 	int fouls[2] = {0, 0};
+	// 反則しても手番は変わらず同じ局面で指し直しになる。信念の診断を毎回取ると
+	// 「反則が多い設定ほど同じ局面を何度も数える」ことになり、
+	// king_acc / occ_rec が反則率で重み付いてしまう。1手番につき1回だけ取る。
+	bool retryOfSameTurn = false;
 
 	while (true) {
 		if (stat.plies >= opt.maxPlies) {
@@ -231,7 +235,8 @@ GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool v
 		// 先に取ると「相手の直前の手をまだ反映していない粒子」を今の真の盤と
 		// 比べることになり、この変更が効かせたい経路そのものを測り損ねる。
 		// pos は自分の着手前なので、真の盤としてはここでも同じもの。
-		mover->observe_truth(pos);
+		if (!retryOfSameTurn)
+			mover->observe_truth(pos);
 		if (m == Move::none()) {
 			stat.winner = 1 - side;
 			stat.reason = "resign";
@@ -243,6 +248,7 @@ GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool v
 		mover->observe_verdict(wasLegal);
 		if (!wasLegal) {
 			fouls[side]++;
+			retryOfSameTurn = true;
 			mover->on_our_foul(m);
 			if (fouls[side] >= MAX_FOULS) {
 				stat.winner = 1 - side;
@@ -259,6 +265,7 @@ GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool v
 		sts.emplace_back();
 		pos.do_move(m, sts.back());
 		stat.plies++;
+		retryOfSameTurn = false;
 
 		mover->on_our_move_accepted(m, capRole, gives);
 		other->on_opp_move(capRole == NO_PIECE_TYPE ? SQ_NB : m.to_sq(), gives);

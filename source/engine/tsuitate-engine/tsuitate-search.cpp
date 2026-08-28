@@ -25,6 +25,8 @@
 #if defined(TSUITATE_ENGINE)
 
 #include <iostream>
+#include <cerrno>
+#include <cstdlib>
 #include <sstream>
 #include <string>
 
@@ -42,32 +44,92 @@ namespace Tsuitate {
 
 namespace {
 
-// 設定キーの適用。`set`(実対局)と`arena p1cfg/p2cfg`(A/B比較)で共有する。
-bool set_config_key(Config& c, const std::string& key, const std::string& val) {
-	if (key == "particles") c.particles = std::stoi(val);
-	else if (key == "stage1") c.stage1Samples = std::stoi(val);
-	else if (key == "stage2") c.stage2Samples = std::stoi(val);
-	else if (key == "topk") c.stage2TopK = std::stoi(val);
-	else if (key == "depth") c.searchDepth = std::stoi(val);
-	else if (key == "budget") c.budgetMs = std::stoi(val);
-	else if (key == "regentries") c.regenTries = std::stoi(val);
-	else if (key == "policytemp") c.policyTemp = std::stod(val);
-	else if (key == "policyeps") c.policyEps = std::stod(val);
-	else if (key == "foulbase") c.foulBaseCp = std::stod(val);
-	else if (key == "foulstep") c.foulStepCp = std::stod(val);
-	else if (key == "foulopp") c.foulOppW = std::stod(val);
-	else if (key == "plegalprior") c.pLegalPrior = std::stod(val);
-	else if (key == "blockcp") c.blockCp = std::stod(val);
-	else if (key == "blocksamples") c.blockSamples = std::stoi(val);
-	else if (key == "opppolicy") c.oppPolicy = std::stoi(val);
-	else if (key == "deduce") c.deduce = std::stoi(val);
-	else if (key == "synthprior") c.synthPrior = std::stoi(val);
-	else if (key == "syncpct") c.syncPct = std::stoi(val);
-	else if (key == "regenfloor") c.regenFloorPct = std::stoi(val);
-	else if (key == "seed") c.seed = std::stoull(val);
-	else if (key == "loglevel") c.logLevel = std::stoi(val);
-	else return false;
+// -fno-exceptions でビルドしているので std::stoi / std::stod は使えない。
+// 不正な文字列を渡すと例外が投げられ、そのまま std::terminate でプロセスが落ちる
+// (`set particles`(値なし)や `arena p1cfg foulbase`(値なし)で実際に落ちていた)。
+// 失敗を戻り値で返すパーサに置き換える。
+bool parse_ll(const std::string& s, long long& out) {
+	if (s.empty())
+		return false;
+	errno = 0;
+	char* end = nullptr;
+	long long v = std::strtoll(s.c_str(), &end, 10);
+	if (errno != 0 || end == s.c_str() || *end != '\0')
+		return false;
+	out = v;
 	return true;
+}
+
+bool parse_d(const std::string& s, double& out) {
+	if (s.empty())
+		return false;
+	errno = 0;
+	char* end = nullptr;
+	double v = std::strtod(s.c_str(), &end);
+	// -ffast-math が有効なので isfinite は使えない(UB)。
+	// 桁あふれ(HUGE_VAL)や桁落ちは strtod が errno=ERANGE で知らせるので、
+	// それと下の範囲検査で十分。
+	if (errno != 0 || end == s.c_str() || *end != '\0')
+		return false;
+	out = v;
+	return true;
+}
+
+// 設定キーの適用。`set`(実対局)と `arena p1cfg/p2cfg`(A/B比較)で共有する。
+// 未知のキー・不正な値・範囲外の値はすべて false を返す(適用しない)。
+bool set_config_key(Config& c, const std::string& key, const std::string& val) {
+	long long iv = 0;
+	double    dv = 0;
+	const bool okI = parse_ll(val, iv);
+	const bool okD = parse_d(val, dv);
+	bool ok = true;
+
+	// 整数キー: 範囲外なら適用しない(0除算やNaNを構造的に防ぐ)
+	auto I = [&](long long lo, long long hi) -> int {
+		if (!okI || iv < lo || iv > hi) { ok = false; return 0; }
+		return int(iv);
+	};
+	// 実数キー
+	auto D = [&](double lo, double hi) -> double {
+		if (!okD || dv < lo || dv > hi) { ok = false; return 0.0; }
+		return dv;
+	};
+	auto apply_i = [&](int& dst, long long lo, long long hi) {
+		int v = I(lo, hi);
+		if (ok) dst = v;
+	};
+	auto apply_d = [&](double& dst, double lo, double hi) {
+		double v = D(lo, hi);
+		if (ok) dst = v;
+	};
+
+	if      (key == "particles")    apply_i(c.particles, 1, 100000);
+	else if (key == "stage1")       apply_i(c.stage1Samples, 1, 100000);
+	else if (key == "stage2")       apply_i(c.stage2Samples, 1, 100000);
+	else if (key == "topk")         apply_i(c.stage2TopK, 1, 1000);
+	else if (key == "depth")        apply_i(c.searchDepth, 0, 64);
+	else if (key == "budget")       apply_i(c.budgetMs, 1, 3600000);
+	else if (key == "regentries")   apply_i(c.regenTries, 0, 10000000);
+	else if (key == "blocksamples") apply_i(c.blockSamples, 1, 100000);
+	else if (key == "opppolicy")    apply_i(c.oppPolicy, 0, 1);
+	else if (key == "deduce")       apply_i(c.deduce, 0, 1);
+	else if (key == "synthprior")   apply_i(c.synthPrior, 0, 1);
+	else if (key == "syncpct")      apply_i(c.syncPct, 0, 100);
+	else if (key == "regenfloor")   apply_i(c.regenFloorPct, 0, 100);
+	else if (key == "loglevel")     apply_i(c.logLevel, 0, 2);
+	else if (key == "policytemp")   apply_d(c.policyTemp, 1.0, 100000.0);
+	else if (key == "policyeps")    apply_d(c.policyEps, 0.0, 1.0);
+	else if (key == "foulbase")     apply_d(c.foulBaseCp, 0.0, 1e6);
+	else if (key == "foulstep")     apply_d(c.foulStepCp, 0.0, 1e6);
+	else if (key == "foulopp")      apply_d(c.foulOppW, 0.0, 100.0);
+	else if (key == "plegalprior")  apply_d(c.pLegalPrior, 0.0, 1e6);
+	else if (key == "blockcp")      apply_d(c.blockCp, 0.0, 1e6);
+	else if (key == "seed") {
+		if (!okI || iv < 0) return false;
+		c.seed = uint64_t(iv);
+	}
+	else return false;
+	return ok;
 }
 
 class ProtocolLoop {
@@ -134,7 +196,7 @@ private:
 		std::string key, val;
 		is >> key >> val;
 		if (!set_config_key(cfg_, key, val)) {
-			sync_cout << "info string unknown option: " << key << sync_endl;
+			sync_cout << "info string bad option: " << key << " = " << val << sync_endl;
 			return;
 		}
 		sync_cout << "info string set " << key << " = " << val << sync_endl;
@@ -243,12 +305,15 @@ private:
 		ArenaOptions opt;
 		opt.cfg  = cfg_;
 		opt.cfg2 = cfg_;
+		// アリーナの既定は300ms/手(実対局の思考予算とは別物)。
+		// `budget` で両者、`p1cfg budget` / `p2cfg budget` で片側だけ変えられる。
+		opt.cfg.budgetMs = opt.cfg2.budgetMs = 300;
 		std::string tok;
 		while (is >> tok) {
 			if (tok == "games") is >> opt.games;
 			else if (tok == "p1") is >> opt.p1;
 			else if (tok == "p2") is >> opt.p2;
-			else if (tok == "budget") is >> opt.budgetMs;
+			else if (tok == "budget") { int b = 0; is >> b; opt.cfg.budgetMs = opt.cfg2.budgetMs = b; }
 			else if (tok == "seed") is >> opt.seed;
 			else if (tok == "particles") { is >> opt.cfg.particles; opt.cfg2.particles = opt.cfg.particles; }
 			else if (tok == "verbose") opt.verbose = true;
@@ -258,7 +323,7 @@ private:
 				std::string k, v;
 				is >> k >> v;
 				if (!set_config_key(tok == "p1cfg" ? opt.cfg : opt.cfg2, k, v))
-					sync_cout << "info string unknown option: " << k << sync_endl;
+					sync_cout << "info string bad option: " << k << " = " << v << sync_endl;
 			}
 		}
 		run_arena(opt);

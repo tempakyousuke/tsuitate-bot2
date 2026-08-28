@@ -497,9 +497,12 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 					// 演繹による減衰(強制配置のマスは演繹そのものなので掛けない)
 					if (cfg_.deduce && strictStale && forced == SQ_NB)
 						w *= stale_factor(view.stale(sq));
-					// 二歩になるマスには置かない(成りに倒す判定は後段)
+					// 二歩になる筋は「と金なら置ける」ので、重み0にはしない。
+					// 0にすると後段の「二歩なら成りに倒す」が死にコードになり、
+					// 相手の生歩が空き筋より多いとき(と金が要るとき)に
+					// place(PAWN) が必ず失敗して合成粒子が作れなくなる。
 					if (raw == PAWN && pawnFile[file_of(sq)])
-						w = 0;
+						w *= 0.15;
 				}
 				wbuf[k] = w;
 				total += w;
@@ -723,7 +726,10 @@ void Belief::force_resynthesize(const OwnView& view, TimePoint deadline) {
 	size_t target = std::max<size_t>(16, size_t(cfg_.particles) / 4);
 	// synthesize は1回あたり最大30試行回るので、回数だけでなく時計でも止める
 	// (sync が予算を使ったあとに呼ばれるため、ここで時間切れを起こしうる)。
-	while (parts_.size() < target && misses < 400 && now() < deadline) {
+	// 締め切りを過ぎていても、1つも作れていないうちは打ち切らない
+	// (空の信念で戻ると呼び出し側が手を選べなくなる)。
+	while (parts_.size() < target && misses < 400
+	       && (parts_.empty() || now() < deadline)) {
 		auto p = synthesize(view);
 		if (p)
 			parts_.push_back(std::move(p));

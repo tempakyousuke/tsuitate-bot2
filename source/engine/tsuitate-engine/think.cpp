@@ -147,8 +147,9 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	const auto& parts = belief.particles();
 	const size_t N    = parts.size();
 
-	// 粒子ゼロ: ヒューリスティックで指す(それでも投了よりまし)
-	if (N == 0) {
+	// 粒子ゼロ: ヒューリスティックで指す(それでも投了よりまし)。
+	// 信念の破産処理(下)が作り直しに失敗した直後にも使う。
+	auto heuristic_pick = [&]() {
 		double best = -1e18;
 		for (Move m : cands) {
 			double s = fallback_score(view, m, rng);
@@ -156,7 +157,9 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		}
 		res.elapsedMs = now() - t0;
 		return res;
-	}
+	};
+	if (N == 0)
+		return heuristic_pick();
 
 	// 3) 合法率と「合法な粒子のindex」を全候補について求める
 	size_t M = cands.size();
@@ -181,10 +184,19 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 			maxLegal = std::max(maxLegal, legalIdx[i].size());
 		if (maxLegal == 0) {
 			// sync が予算の syncPct% を使ったあと。作り直しにも同じだけ上限を与える。
-			belief.force_resynthesize(view, std::min(now() + budgetMs * cfg.syncPct / 100,
-			                                        deadline - 50));
+			// sync は締め切りを最大100ms超過しうるので、ここで既に過去の時刻に
+			// なっていることがある。最低限の時間は必ず与える(でないと1粒子も
+			// 作らずに空の信念で先へ進んでしまう)。
+			TimePoint reDeadline = std::min(now() + budgetMs * cfg.syncPct / 100,
+			                                deadline - 50);
+			belief.force_resynthesize(view, std::max(reDeadline, now() + 20));
 			res.nParticles = belief.size();
 			res.relaxLevel = belief.relaxLevel();
+			// 作り直しにも失敗した(合成粒子が1つも作れない)。
+			// このまま進むと全候補の評価が反則コストで並んで選択が無意味になるので、
+			// 「見えない駒に当たりにくい手」のヒューリスティックに委ねる。
+			if (belief.particles().empty())
+				return heuristic_pick();
 			scan_legality();
 		}
 	}

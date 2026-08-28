@@ -16,7 +16,6 @@ namespace Tsuitate {
 
 struct ArenaOptions {
 	int      games       = 20;
-	int      budgetMs    = 300;    // belief側の1手予算
 	int      maxPlies    = 400;    // 引き分け打ち切り
 	uint64_t seed        = 20260827;
 	// プレイヤー種別: "belief"(本体) / "heuristic"(前進ヒューリスティック)
@@ -24,6 +23,8 @@ struct ArenaOptions {
 	std::string p2 = "heuristic";
 	// belief側の設定。p1/p2で別々に持てるので、同一バイナリ内でA/B比較ができる
 	// (`p1cfg <key> <val>` / `p2cfg <key> <val>` で個別に上書きする)。
+	// 1手の思考予算も cfg.budgetMs / cfg2.budgetMs から取るので、
+	// 予算そのものをA/Bの対象にできる。
 	Config   cfg;
 	Config   cfg2;
 	bool     verbose = false;
