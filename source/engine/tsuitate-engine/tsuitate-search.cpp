@@ -24,15 +24,19 @@
 
 #if defined(TSUITATE_ENGINE)
 
+#include <algorithm>
 #include <iostream>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "../../types.h"
 #include "../../position.h"
+#include "../../movegen.h"
 #include "../../usi.h"
 #include "../../misc.h"
 
@@ -113,6 +117,22 @@ bool set_config_key(Config& c, const std::string& key, const std::string& val) {
 	else if (key == "regentries")   apply_i(c.regenTries, 0, 10000000);
 	else if (key == "blocksamples") apply_i(c.blockSamples, 1, 100000);
 	else if (key == "opppolicy")    apply_i(c.oppPolicy, 0, 1);
+	// 探索の相手モデル(非千里眼化)
+	else if (key == "oppmodel")     apply_i(c.oppModel, 0, 2);
+	else if (key == "oppreplyk")    apply_i(c.oppReplyK, 1, 128);
+	else if (key == "oppreplykdeep") apply_i(c.oppReplyKDeep, 1, 128);
+	// 0 = stage1は従来の千里眼qsearchのまま
+	else if (key == "oppreplykstage1") apply_i(c.oppReplyKStage1, 0, 128);
+	else if (key == "oppcheckprior") apply_i(c.oppCheckPrior, 0, 1);
+	else if (key == "opplambda")    apply_d(c.oppLambda, 0.0, 1.0);
+	// 相手の期待反則回数の上限。1手番で相手が10回反則すれば即負けなので、
+	// 意味のある範囲は高々数回。青天井にすると相手の反則を当てにした
+	// 楽観的な読み筋だけが選ばれる。
+	else if (key == "oppfoulcap")   apply_d(c.oppFoulCap, 0.0, 10.0);
+	// 相手の反則1回をこちらの利得としてどれだけ評価するか(foul_valueへの倍率)。
+	// 1手の評価に効く上限は foul_value×oppFoulCap×これ なので、
+	// 詰みスコアを超えない範囲に絞る。
+	else if (key == "foulgain")     apply_d(c.foulGainScale, 0.0, 4.0);
 	else if (key == "deduce")       apply_i(c.deduce, 0, 1);
 	else if (key == "synthprior")   apply_i(c.synthPrior, 0, 1);
 	else if (key == "syncpct")      apply_i(c.syncPct, 0, 100);
@@ -134,6 +154,62 @@ bool set_config_key(Config& c, const std::string& key, const std::string& val) {
 	}
 	else return false;
 	return ok;
+}
+
+// enumerate_opp_intents の不変条件テスト。
+//
+// 探索の相手ノード(opp_node)は「合法な意図がゼロ ⟺ 相手に合法手がない」と見なして
+// mated_in を返す。これは
+//   意図の集合(相手の視界で生成した手) ⊇ 真の局面での相手の合法手
+// が成り立つときだけ正しい。見えない駒はスライダーの利きを**伸ばす方向にしか**
+// 効かないので理屈の上では成立するが、生成器の細部(成り変種・行き所のない駒・
+// 二歩の扱い)を取り違えると静かに破れる。破れると「詰んでいないのに詰みと読む」
+// という最悪の壊れ方をするので、ランダム局面で実際に確かめる。
+void cmd_check_intents(long long games, long long maxPlies) {
+	PRNG rng(20260828);
+	long long positions = 0, missing = 0, intentsTotal = 0, legalTotal = 0;
+	Config cfg;  // priorの設定は集合の中身に影響しない(順序だけ)
+	for (long long g = 0; g < games; ++g) {
+		Position pos;
+		std::deque<StateInfo> sts;
+		sts.emplace_back();
+		pos.set_hirate(&sts.back());
+		for (long long p = 0; p < maxPlies; ++p) {
+			MoveList<LEGAL_ALL> ml(pos);
+			if (ml.size() == 0)
+				break;
+			// 手番側を「相手」とみなして意図を列挙し、合法手を全部含むか確かめる
+			const Color side = pos.side_to_move();
+			std::vector<OppIntent> intents;
+			enumerate_opp_intents(pos, side, intents, pos.in_check(), cfg);
+			// Move は operator<() を持たない(types.h が意図的に定義していない)ので、
+			// 下位16bit(from/to/drop/promote)をキーに突き合わせる。
+			// 同一局面なら動かす駒は from から一意に決まるので、これで同定できる。
+			std::vector<uint16_t> got;
+			got.reserve(intents.size());
+			for (const auto& it : intents)
+				got.push_back(it.m.raw());
+			std::sort(got.begin(), got.end());
+			for (auto ext : ml) {
+				Move m = ext;
+				if (!std::binary_search(got.begin(), got.end(), m.raw())) {
+					++missing;
+					if (missing <= 5)
+						sync_cout << "info string MISSING legal move " << to_usi_string(m)
+						          << " sfen " << pos.sfen() << sync_endl;
+				}
+			}
+			++positions;
+			intentsTotal += (long long) intents.size();
+			legalTotal   += (long long) ml.size();
+			pos.do_move(ml.at(rng.rand<uint64_t>() % ml.size()), sts.emplace_back());
+		}
+	}
+	sync_cout << "info string checkintents positions=" << positions
+	          << " legal_total=" << legalTotal
+	          << " intents_total=" << intentsTotal
+	          << " missing=" << missing
+	          << (missing == 0 ? "  OK (意図 ⊇ 合法手)" : "  FAILED") << sync_endl;
 }
 
 class ProtocolLoop {
@@ -191,6 +267,15 @@ private:
 			cmd_state();
 		else if (cmd == "arena")
 			cmd_arena(is);
+		else if (cmd == "checkintents") {
+			// checkintents [games] [maxplies]
+			// 相手ノードが依存する不変条件(意図 ⊇ 合法手)のランダム検証
+			std::string a;
+			long long games = 200, plies = 120, x = 0;
+			if (is >> a && parse_ll(a, x) && x > 0 && x <= 100000) games = x;
+			if (is >> a && parse_ll(a, x) && x > 0 && x <= 100000) plies = x;
+			cmd_check_intents(games, plies);
+		}
 		else
 			sync_cout << "info string unknown command: " << cmd << sync_endl;
 		return true;

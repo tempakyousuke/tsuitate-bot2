@@ -4,6 +4,8 @@
 #if defined(TSUITATE_ENGINE)
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 
 #include "../../movegen.h"
 #include "../../evaluate.h"
@@ -89,12 +91,134 @@ Value DSearch::qsearch(Position& pos, Value alpha, Value beta, int ply) {
 	return best;
 }
 
+// 相手ノードの非千里眼評価。返り値は相手視点。
+//
+// 素のnegamaxは相手ノードで「こちらの駒が全部見えている相手の最善手」を選ぶ。
+// ついたて将棋の相手にはこちらの駒が見えないので、これは
+//   - 前進の過小評価(進めた駒は必ず取られると読む)
+//   - 王手の過小評価(探索内の相手は必ず正しく逃げる)
+//   - 妨害の無価値化(探索内の相手は反則しない)
+// という構造的なバイアスになる。ここを信念側と同じ生成モデルに揃える。
+Value DSearch::opp_node(Position& pos, int depth, int ply) {
+	const Color opp     = ~us;
+	const bool  inCheck = pos.in_check();
+
+	// 相手の視界(相手自身の駒だけ)での「指したい手」。真の盤では反則になる手も
+	// 含まれていて、その割合が相手の反則確率になる。
+	std::vector<OppIntent> intents;
+	enumerate_opp_intents(pos, opp, intents, inCheck, *cfg);
+	const size_t n = intents.size();
+	if (n == 0)
+		return mated_in(ply);  // 動かせる駒も打てる駒もない
+
+	// prior の softmax + ε一様。信念の sample_policy と同じ重み付けにする
+	// (相手モデルが探索と信念で食い違うと、p_legal と探索値が別の相手を仮定する)。
+	double mx = -1e18;
+	for (const auto& it : intents)
+		mx = std::max(mx, double(it.score));
+	std::vector<double> w(n);
+	double sum = 0;
+	for (size_t i = 0; i < n; ++i) {
+		w[i] = std::exp((double(intents[i].score) - mx) / cfg->policyTemp);
+		sum += w[i];
+	}
+	for (size_t i = 0; i < n; ++i)
+		w[i] = (1.0 - cfg->policyEps) * (w[i] / sum) + cfg->policyEps / double(n);
+
+	// 合法な意図の質量 p_ok。相手は反則しても手番が変わらず指し直しになるので、
+	// 1手番あたりの期待反則回数は幾何分布で (1 − p_ok)/p_ok。
+	//
+	// enumerate_opp_intents は相手の合法手を必ず含む(見えないこちらの駒は
+	// スライダーの利きを伸ばす方向にしか効かないので、意図の集合は合法手の上位集合)。
+	// したがって「合法な意図がゼロ = 相手に合法手がない = 相手の負け」が厳密に言える。
+	std::vector<uint32_t> legal;
+	legal.reserve(n);
+	double pOk = 0;
+	for (size_t i = 0; i < n; ++i)
+		if (pos.pseudo_legal_s<true>(intents[i].m) && pos.legal(intents[i].m)) {
+			legal.push_back(uint32_t(i));
+			pOk += w[i];
+		}
+	if (legal.empty())
+		return mated_in(ply);
+
+	// 展開する応手 = prior上位k手。
+	int kWant = (ply == 1) ? (oppK1 > 0 ? oppK1 : cfg->oppReplyK) : cfg->oppReplyKDeep;
+	size_t k  = std::min(size_t(std::max(1, kWant)), legal.size());
+	std::partial_sort(legal.begin(), legal.begin() + k, legal.end(),
+	                  [&](uint32_t a, uint32_t b) { return w[a] > w[b]; });
+	std::vector<uint32_t> sel(legal.begin(), legal.begin() + k);
+
+	// これに「最も価値の高い捕獲」を必ず足す。λ項(千里眼の最善応手)はこの集合の
+	// 上でしか取れないので、priorの低い殺し手 —— まさに「こちらの駒が取られる筋」——
+	// が漏れると、混合が丸ごと楽観に倒れる。期待値側は元の重み w のままなので、
+	// prior の低いこの手を足しても期待値はほとんど動かない。
+	{
+		uint32_t bestCap = UINT32_MAX;
+		int      bestVal = 0;
+		for (uint32_t i : legal) {
+			Move m = intents[i].m;
+			if (m.is_drop())
+				continue;
+			Piece cap = pos.piece_on(m.to_sq());
+			if (cap == NO_PIECE)
+				continue;
+			int v = Eval::CapturePieceValue[type_of(cap)];
+			if (v > bestVal) { bestVal = v; bestCap = i; }
+		}
+		if (bestCap != UINT32_MAX && std::find(sel.begin(), sel.end(), bestCap) == sel.end())
+			sel.push_back(bestCap);
+	}
+
+	double wSel = 0;
+	for (uint32_t i : sel)
+		wSel += w[i];
+	if (!(wSel > 0))
+		wSel = 1.0;  // ε一様混合があるので通常ありえないが、0除算だけは構造的に防ぐ
+
+	// 期待値ノードなのでαβ窓は使えない(どの子も重み付きで効くため打ち切れない)。
+	double expVal = 0;      // 相手視点の期待値
+	double maxVal = -1e18;  // 同じ集合の上での千里眼最善
+	for (uint32_t i : sel) {
+		StateInfo st;
+		pos.do_move(intents[i].m, st);
+		Value v = -search(pos, depth - 1, -VALUE_INFINITE, VALUE_INFINITE, ply + 1);
+		pos.undo_move(intents[i].m);
+		// 「相手が3割の確率で詰みを見逃す」は大きな正の値であって詰みではない。
+		// 期待値に混ぜる前に飽和させておかないと、詰みスコアが確率で薄まった値が
+		// 詰みスコアの範囲に残って上位ノードの解釈を壊す。
+		double s = squash_cp(v);
+		expVal += (w[i] / wSel) * s;
+		maxVal = std::max(maxVal, s);
+	}
+
+	const double lambda = std::clamp(cfg->oppLambda, 0.0, 1.0);
+	double v = (1.0 - lambda) * expVal + lambda * maxVal;
+
+	// 相手の期待反則。相手視点の値なので減点する。
+	// p_ok→0 で発散するが、p_ok は手書きpriorに依存する粗い量なので上限を掛ける
+	// (青天井にすると「相手は必ず反則する」と信じ込んだ楽観的な読み筋を選ぶ)。
+	const double eFoul = std::min(cfg->oppFoulCap, (1.0 - pOk) / std::max(pOk, 1e-6));
+	v -= foulGain * eFoul;
+
+	// 詰みスコアの範囲には入れない(この値は確率混合であって詰みの保証ではない)。
+	// 上の mated_in だけが本物の詰みを返す経路。
+	return Value(int(std::clamp(v, -2500.0, 2500.0)));
+}
+
 Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply) {
 	if (depth <= 0)
 		return qsearch(pos, alpha, beta, ply);
 	++nodes;
 	if (ply >= MAX_PLY || nodes > nodesLimit)
 		return Eval::evaluate(pos);
+
+	// 相手ノードの非千里眼モデル。mate_1ply より前に分岐すること:
+	// 「相手が1手詰めを見つける」のはこちらの玉が見えている前提そのもので、
+	// この施策が消したいバイアスの中心にある。
+	if (cfg && cfg->oppModel > 0 && us != COLOR_NB && pos.side_to_move() != us
+	    && (cfg->oppModel >= 2 || ply == 1))
+		return opp_node(pos, depth, ply);
 
 	const bool inCheck = pos.in_check();
 

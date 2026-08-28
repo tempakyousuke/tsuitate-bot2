@@ -232,8 +232,8 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	};
 
 	// 反則コスト(centipawn)。累計10回で反則負けなので、残り予算が減るほど急騰させる。
-	double remain = std::max(1.0, 10.0 - view.ourFouls);
-	double foulCp = -(cfg.foulBaseCp + cfg.foulStepCp * view.ourFouls) * (10.0 / remain);
+	// 値付けは foul_value に一本化してある(相手の反則の利得も同じ式の鏡像を使う)。
+	double foulCp = -foul_value(cfg.foulBaseCp, cfg.foulStepCp, view.ourFouls);
 	// 相手が反則負けに近い = こちらが勝勢。勝ちを守るためリスクをさらに嫌う。
 	foulCp *= 1.0 + cfg.foulOppW * view.oppFouls;
 	// 信念の品質が悪い(緩和粒子・粒子不足)ときはp_legalの推定が信用できないので、
@@ -244,10 +244,20 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	if (NP * 4 < size_t(cfg.particles))
 		foulCp *= 2.0;
 
+	// 相手の反則1回のこちらから見た価値。探索の相手ノード(oppModel)が
+	// 「相手がこの局面で何回反則しそうか」に掛けて使う。自分の反則コストと
+	// 同じ foul_value を使うので、値付けが2か所に分かれない。
+	const double foulGain =
+	    cfg.foulGainScale * foul_value(cfg.foulBaseCp, cfg.foulStepCp, view.oppFouls);
+
 	// 妨害マップ(相手の反則を誘う配置への加点)。合法だったときにだけ効くので
 	// p_legal を掛ける。移動元を空けるぶんは差し引く。
+	//
+	// oppModel >= 1 のときは探索の相手ノードが同じ効果を(相手の意図分布に
+	// 重み付けした正しい形で)内側で数えるので、ここでは加点しない。
+	// 両方効かせると同じ妨害を二重に数えることになる。
 	std::vector<double> blockBonus(M, 0.0);
-	if (cfg.blockCp > 0.0 && NP > 0) {
+	if (cfg.blockCp > 0.0 && cfg.oppModel == 0 && NP > 0) {
 		double map[SQ_NB];
 		block_map(parts, view.us, size_t(cfg.blockSamples), map);
 		for (size_t i = 0; i < M; ++i) {
@@ -292,8 +302,21 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 			StateInfo st;
 			DSearch ds;
 			ds.nodesLimit = 20000;
+			ds.cfg = &cfg;
+			ds.us = view.us;
+			ds.foulGain = foulGain;
+			ds.oppK1 = cfg.oppReplyKStage1;
 			pos.do_move(cands[i], st);
-			Value v = -ds.qsearch(pos, -VALUE_INFINITE, VALUE_INFINITE, 1);
+			// stage1 は本来この一手ぶんの静止探索だけで粗く序列化する段。
+			// ただし千里眼のqsearchは「進めた駒は必ず取られる」と読むので、
+			// 相手モデルを入れたい前進手が上位12手に残らずstage2に届かない。
+			// oppReplyKStage1 > 0 なら深さ1の探索(= 相手ノード1つ + その子のqsearch)に
+			// 差し替えて、序列化にも同じ相手モデルを効かせる。
+			Value v;
+			if (cfg.oppModel > 0 && cfg.oppReplyKStage1 > 0)
+				v = -ds.search(pos, 1, -VALUE_INFINITE, VALUE_INFINITE, 1);
+			else
+				v = -ds.qsearch(pos, -VALUE_INFINITE, VALUE_INFINITE, 1);
 			pos.undo_move(cands[i]);
 			sum += squash_cp(v);
 		}
@@ -329,6 +352,9 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 				StateInfo st;
 				DSearch ds;
 				ds.nodesLimit = 60000;
+				ds.cfg        = &cfg;
+				ds.us         = view.us;
+				ds.foulGain   = foulGain;
 				pos.do_move(cands[i], st);
 				Value v = -ds.search(pos, d - 1, -VALUE_INFINITE, VALUE_INFINITE, 1);
 				pos.undo_move(cands[i]);

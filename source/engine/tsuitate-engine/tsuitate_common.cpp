@@ -201,6 +201,121 @@ std::vector<Move> generate_candidates(const OwnView& view) {
 }
 
 // ---------------------------------------------------------------------------
+// 相手の意図(非千里眼モデル)
+// ---------------------------------------------------------------------------
+
+int fast_policy_score(const Position& pos, Color opp, Move m, bool inCheck,
+                      const Config& cfg) {
+	// 駒種ごとの「前進したさ」(centipawn相当)
+	static const int PUSH[PIECE_TYPE_NB] = {
+		0,    // NO_PIECE_TYPE
+		110,  // PAWN
+		70,   // LANCE
+		85,   // KNIGHT
+		95,   // SILVER
+		55,   // BISHOP
+		65,   // ROOK
+		80,   // GOLD
+		-40,  // KING(前進はむしろ嫌う)
+		90, 70, 80, 85,  // PRO_PAWN, PRO_LANCE, PRO_KNIGHT, PRO_SILVER
+		70, 80,          // HORSE, DRAGON
+	};
+	const Square to = m.to_sq();
+	// 端よりは中央
+	int s = 10 * (4 - std::abs(int(file_of(to)) - int(FILE_5)));
+
+	// 王手を宣言された側は「自分が王手されている」ことだけは知っている
+	// (宣言は両者に届く)。ただしどの駒からの王手かは見えないので、
+	// 確実に応じられる手は玉を動かすことしかない。素のpriorは玉移動を
+	// 強く嫌う(下の -250)ので、王手中はその符号を逆転させる。
+	const bool checkAware = inCheck && cfg.oppCheckPrior != 0;
+
+	if (m.is_drop()) {
+		// 打ちは移動手に比べて少数派。敵陣(=こちら側)への打ち込みは好まれる。
+		s -= 150;
+		if (relative_rank(opp, rank_of(to)) <= RANK_4)
+			s += 80;
+		// 王手されているのに打つのは「合駒」だが、どこを遮ればよいか見えないので
+		// 相手にとってはほぼ当てずっぽう。玉を逃がす手に比べて選ばれにくい。
+		if (checkAware)
+			s -= 200;
+		return s;
+	}
+
+	const Square    from = m.from_sq();
+	const PieceType pt   = type_of(pos.piece_on(from));
+	// 相手から見た前進量。スライダーの大移動は「通ること」自体が稀なので頭打ちにする
+	int adv = int(relative_rank(opp, rank_of(from))) - int(relative_rank(opp, rank_of(to)));
+	adv = std::clamp(adv, -2, 3);
+	s += PUSH[pt] * adv;
+	if (m.is_promote())
+		s += 300;
+	if (pt == KING)
+		s += checkAware ? 400 : -250;  // 平時はむやみに動かさない / 王手なら逃げる
+	return s;
+}
+
+void enumerate_opp_intents(const Position& pos, Color opp, std::vector<OppIntent>& out,
+                           bool inCheck, const Config& cfg) {
+	out.clear();
+	// 相手に見えている盤 = 相手自身の駒だけ。こちらの駒は存在しないものとして
+	// 手を生成するので、経路封鎖・打ちマス占有・自玉放置で反則になる手も混じる。
+	// その割合がそのまま相手の反則確率なので、ここで除いてはいけない。
+	const Bitboard oppOcc = pos.pieces(opp);
+
+	// 盤上の駒の移動
+	Bitboard movers = oppOcc;
+	while (movers) {
+		Square from = movers.pop();
+		Piece  pc   = pos.piece_on(from);
+		PieceType pt = type_of(pc);
+		Bitboard att = effects_from(pc, from, oppOcc) & ~oppOcc;
+		while (att) {
+			Square to = att.pop();
+			bool promotable = pt <= ROOK && canPromote(opp, from, to);
+			if (piece_can_stay(opp, pt, to)) {
+				Move m = make_move(from, to, opp, pt);
+				out.push_back({m, fast_policy_score(pos, opp, m, inCheck, cfg)});
+			}
+			if (promotable) {
+				Move m = make_move_promote(from, to, opp, pt);
+				out.push_back({m, fast_policy_score(pos, opp, m, inCheck, cfg)});
+			}
+		}
+	}
+
+	// 打ち。二歩は相手自身の歩だけで判定できる(相手には自分の歩が見えている)。
+	const Hand h = pos.hand_of(opp);
+	for (PieceType pt : {PAWN, LANCE, KNIGHT, SILVER, GOLD, BISHOP, ROOK}) {
+		if (!hand_exists(h, pt))
+			continue;
+		Bitboard banFiles = Bitboard(ZERO);
+		if (pt == PAWN) {
+			Bitboard pawns = pos.pieces(PAWN) & oppOcc;
+			while (pawns)
+				banFiles = banFiles | file_bb(file_of(pawns.pop()));
+		}
+		for (auto to : SQ) {
+			if (oppOcc & to)
+				continue;
+			if (!piece_can_stay(opp, pt, to))
+				continue;
+			if (pt == PAWN && (banFiles & to))
+				continue;
+			Move m = make_move_drop(pt, to, opp);
+			out.push_back({m, fast_policy_score(pos, opp, m, inCheck, cfg)});
+		}
+	}
+}
+
+double foul_value(double baseCp, double stepCp, int fouls) {
+	// f=10 は反則負けで局が終わっているので到達しない。0除算を構造的に防ぐため
+	// 上限9でクランプする(呼び出し側の累計がずれても壊れないように)。
+	int f = std::clamp(fouls, 0, 9);
+	return (baseCp + stepCp * double(f)) * (10.0 / double(10 - f));
+}
+
+// ---------------------------------------------------------------------------
 // 表記変換
 // ---------------------------------------------------------------------------
 

@@ -360,6 +360,13 @@ void run_arena(const ArenaOptions& opt) {
 
 	int p1Wins = 0, p2Wins = 0, draws = 0;
 	long long p1Fouls = 0, p2Fouls = 0, plies = 0;
+	// 決着理由の内訳。信念を良くしても反則の消耗戦で勝っているだけ、という状態を
+	// 総合勝率は隠してしまう(第2版は勝ち星38のうち32が反則負け由来で、
+	// 盤上で決着した12局は6勝6敗の互角だった)。
+	// 「盤上で勝てるようになったか」は総合勝率とは別に数える。
+	int boardGames = 0, boardP1 = 0, boardP2 = 0;  // 詰み/ステイルメイト/投了
+	int foulGames  = 0, foulP1  = 0, foulP2  = 0;  // 反則負け
+	int otherGames = 0;                            // 手数切れ
 	TimePoint t0 = now();
 
 	for (int g = 0; g < opt.games; ++g) {
@@ -371,17 +378,33 @@ void run_arena(const ArenaOptions& opt) {
 		GameStat st  = p1Sente ? play_one(*a, *b, opt, opt.verbose)
 		                       : play_one(*b, *a, opt, opt.verbose);
 		int p1Side = p1Sente ? 0 : 1;
+		const bool p1Won = st.winner == p1Side;
 		if (st.winner == -1)
 			draws++;
-		else if (st.winner == p1Side)
+		else if (p1Won)
 			p1Wins++;
 		else
 			p2Wins++;
+
+		// 決着理由の内訳。反則負け以外で終わった局が「盤上で決着した局」。
+		if (st.winner == -1) {
+			otherGames++;
+		} else if (st.reason == "foul_limit") {
+			foulGames++;
+			(p1Won ? foulP1 : foulP2)++;
+		} else {
+			boardGames++;
+			(p1Won ? boardP1 : boardP2)++;
+		}
 		p1Fouls += st.fouls[p1Side];
 		p2Fouls += st.fouls[1 - p1Side];
 		plies += st.plies;
+		// A/B(p1cfg/p2cfg で片側だけ設定を変える)では両者とも種別名が "belief" に
+		// なるので、種別名だけでは勝者が読めない。p1/p2 を必ず添える。
 		std::cout << "info arena game " << (g + 1) << "/" << opt.games
-		          << " winner=" << (st.winner == -1 ? "draw" : st.winner == p1Side ? opt.p1 : opt.p2)
+		          << " winner=" << (st.winner == -1 ? std::string("draw")
+		                            : p1Won ? "p1(" + opt.p1 + ")" : "p2(" + opt.p2 + ")")
+		          << " sente=" << (p1Sente ? "p1" : "p2")
 		          << " reason=" << st.reason << " plies=" << st.plies
 		          << " fouls=" << st.fouls[p1Side] << "/" << st.fouls[1 - p1Side]
 		          << std::endl;
@@ -394,6 +417,13 @@ void run_arena(const ArenaOptions& opt) {
 	          << ", fouls/game p1=" << (p1Fouls / n) << " p2=" << (p2Fouls / n)
 	          << ", avg plies=" << (plies / n)
 	          << ", elapsed=" << (now() - t0) / 1000 << "s" << std::endl;
+	// 盤上決着の勝敗は「勝ちにいく力」の直接の指標。総合勝率と分けて見ること。
+	std::cout << "  decided: board=" << boardGames
+	          << " (" << opt.p1 << " " << boardP1 << " - " << boardP2 << " " << opt.p2 << ")"
+	          << " foul=" << foulGames
+	          << " (" << opt.p1 << " " << foulP1 << " - " << foulP2 << " " << opt.p2 << ")"
+	          << " other=" << otherGames
+	          << " board_rate=" << (100.0 * boardGames / n) << "%" << std::endl;
 	for (int k = 0; k < 2; ++k) {
 		const ArenaStats& g = g_stats[k];
 		if (g.decisions == 0)

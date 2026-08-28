@@ -71,60 +71,9 @@ void Belief::consistent_opp_moves(const Particle& p, const HistEvent& ev,
 	}
 }
 
-namespace {
-
-// 非千里眼prior(oppPolicy=1)。
-//
-// 相手は「こちらの駒が見えない」ので、相手の着手の好みは相手自身の駒の展開だけで
-// 決まる、というモデル。実際に観測できるのは「その手が合法だった」場合だけなので、
-//   P(相手の手 | 観測) ∝ prior(手) × [その手が真の盤で合法]
-// が正しい生成モデルで、合法性フィルタは consistent_opp_moves が担う。
-//
-// 従来の千里眼モデル(着手後の静的評価のsoftmax)は「相手がこちらの駒を見て
-// 取りに来る/当たりを避ける」ことを前提にしていて、構造的にバイアスがある。
-// さらにこちらは do_move も評価関数呼び出しも不要なので桁違いに速く、
-// 粒子の再生成リプレイ(従来は一様サンプリングだった)でも同じ方策が使える。
-int fast_policy_score(const Position& pos, Color opp, Move m) {
-	// 駒種ごとの「前進したさ」(centipawn相当)
-	static const int PUSH[PIECE_TYPE_NB] = {
-		0,    // NO_PIECE_TYPE
-		110,  // PAWN
-		70,   // LANCE
-		85,   // KNIGHT
-		95,   // SILVER
-		55,   // BISHOP
-		65,   // ROOK
-		80,   // GOLD
-		-40,  // KING(前進はむしろ嫌う)
-		90, 70, 80, 85,  // PRO_PAWN, PRO_LANCE, PRO_KNIGHT, PRO_SILVER
-		70, 80,          // HORSE, DRAGON
-	};
-	const Square to = m.to_sq();
-	// 端よりは中央
-	int s = 10 * (4 - std::abs(int(file_of(to)) - int(FILE_5)));
-
-	if (m.is_drop()) {
-		// 打ちは移動手に比べて少数派。敵陣(=こちら側)への打ち込みは好まれる。
-		s -= 150;
-		if (relative_rank(opp, rank_of(to)) <= RANK_4)
-			s += 80;
-		return s;
-	}
-
-	const Square    from = m.from_sq();
-	const PieceType pt   = type_of(pos.piece_on(from));
-	// 相手から見た前進量。スライダーの大移動は「通ること」自体が稀なので頭打ちにする
-	int adv = int(relative_rank(opp, rank_of(from))) - int(relative_rank(opp, rank_of(to)));
-	adv = std::clamp(adv, -2, 3);
-	s += PUSH[pt] * adv;
-	if (m.is_promote())
-		s += 300;
-	if (pt == KING)
-		s -= 250;  // 玉はむやみに動かさない
-	return s;
-}
-
-} // namespace
+// 非千里眼prior(oppPolicy=1)の本体 fast_policy_score は tsuitate_common.cpp にある。
+// 確定化探索の相手ノード(dsearch.cpp の oppModel)と妨害マップが同じ関数を使うので、
+// ここにローカルに置くと生成モデルが分岐してしまう。
 
 // 特定の1手が観測と整合するかだけを確かめる。
 //
@@ -161,11 +110,13 @@ Move Belief::sample_policy(Particle& p, const std::vector<Move>& moves,
 		return cand[0];
 
 	const Color opp = ~us_;
+	// 王手中かどうかは prior にしか渡さない(cfg_.oppCheckPrior=0 なら無視される)。
+	const bool  oppInCheck = p.pos.in_check();
 	std::vector<double> score(cand.size());
 	double mx = -1e18;
 	for (size_t i = 0; i < cand.size(); ++i) {
 		if (cfg_.oppPolicy != 0) {
-			score[i] = double(fast_policy_score(p.pos, opp, cand[i]));
+			score[i] = double(fast_policy_score(p.pos, opp, cand[i], oppInCheck, cfg_));
 		} else {
 			StateInfo st;
 			p.pos.do_move(cand[i], st);
