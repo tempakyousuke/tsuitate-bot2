@@ -119,6 +119,13 @@ void OwnView::apply_opp_capture(Square capSq) {
 	if (pc != NO_PIECE && type_of(pc) != KING)
 		oppCaptured[pc & 7]++;
 	board[capSq] = NO_PIECE;
+	// 取られたマスには「取った相手の駒」が乗っている。ここを刻み直さないと、
+	// 直前まで自駒がいたせいで emptyStamp が新しいまま
+	//(= 陳腐化度が小さい = まだ空きらしい)になり、
+	// 相手駒が確実にいるマスの重みを下げるという逆向きの演繹になってしまう。
+	// 最新の1マスは synthesize の強制配置(forcedSq)が拾うが、
+	// それ以前に取られたマスはここで「空きとは分かっていない」に戻しておく。
+	emptyStamp[capSq] = -9999;
 }
 
 Bitboard OwnView::occupied() const {

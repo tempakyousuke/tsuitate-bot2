@@ -568,8 +568,10 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 				forcedRaw = avail[rng_.rand<uint64_t>() % avail.size()];
 		}
 
-		if (!place(KING, SQ_NB))
-			continue;
+		// 演繹で決まっているマスを先に埋める。玉を先に置くと、玉がたまたま
+		// 強制配置のマスに乗ってしまい、そのあとの place(forced) が必ず失敗して
+		// 30試行のうち1枠を丸ごと捨てることになる(玉の置き場所は60マス以上あるので、
+		// 先に強制配置を埋めても玉が置けなくなることはまずない)。
 		if (forcedRaw != NO_PIECE_TYPE) {
 			if (!place(forcedRaw, forcedSq))
 				continue;
@@ -591,6 +593,8 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 			oppBoard[raw]--;
 		}
 		if (!ok)
+			continue;
+		if (!place(KING, SQ_NB))
 			continue;
 		for (int pt = PAWN; pt <= GOLD && ok; ++pt) {
 			int cnt = oppBoard[pt] - (checkerRaw == pt ? 1 : 0);
@@ -726,10 +730,12 @@ void Belief::force_resynthesize(const OwnView& view, TimePoint deadline) {
 	size_t target = std::max<size_t>(16, size_t(cfg_.particles) / 4);
 	// synthesize は1回あたり最大30試行回るので、回数だけでなく時計でも止める
 	// (sync が予算を使ったあとに呼ばれるため、ここで時間切れを起こしうる)。
-	// 締め切りを過ぎていても、1つも作れていないうちは打ち切らない
-	// (空の信念で戻ると呼び出し側が手を選べなくなる)。
-	while (parts_.size() < target && misses < 400
-	       && (parts_.empty() || now() < deadline)) {
+	while (parts_.size() < target && misses < 400) {
+		// 締め切りを過ぎていても、1粒子も作れていないうちは少しだけ粘る
+		// (空の信念で戻ると呼び出し側が手を選べなくなる)。ただし無制限にはしない
+		// ―― 粘る回数を絞らないと 400ミス×30試行ぶん予算を食い潰しうる。
+		if (now() >= deadline && (!parts_.empty() || misses >= 40))
+			break;
 		auto p = synthesize(view);
 		if (p)
 			parts_.push_back(std::move(p));

@@ -26,6 +26,7 @@
 
 #include <iostream>
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <sstream>
 #include <string>
@@ -308,23 +309,69 @@ private:
 		// アリーナの既定は300ms/手(実対局の思考予算とは別物)。
 		// `budget` で両者、`p1cfg budget` / `p2cfg budget` で片側だけ変えられる。
 		opt.cfg.budgetMs = opt.cfg2.budgetMs = 300;
+
+		// 数値引数は必ず検証する。`is >> int` に直接読ませると、値を書き忘れたときに
+		// 0が入ったうえで失敗ビットが立ち、**以降の引数が全部黙って捨てられる**
+		// (`arena games 1 budget p2 belief` が budget=0・相手はheuristicのまま
+		//  何事もなかったように走っていた)。
+		bool bad = false;
+		auto num = [&](const char* name, long long lo, long long hi, long long& out) {
+			std::string v;
+			long long   x = 0;
+			if (!(is >> v) || !parse_ll(v, x) || x < lo || x > hi) {
+				sync_cout << "info string bad arena option: " << name << " = " << v << sync_endl;
+				bad = true;
+				return false;
+			}
+			out = x;
+			return true;
+		};
+
 		std::string tok;
-		while (is >> tok) {
-			if (tok == "games") is >> opt.games;
+		while (!bad && is >> tok) {
+			long long x = 0;
+			if (tok == "games") { if (num("games", 1, 100000, x)) opt.games = int(x); }
 			else if (tok == "p1") is >> opt.p1;
 			else if (tok == "p2") is >> opt.p2;
-			else if (tok == "budget") { int b = 0; is >> b; opt.cfg.budgetMs = opt.cfg2.budgetMs = b; }
-			else if (tok == "seed") is >> opt.seed;
-			else if (tok == "particles") { is >> opt.cfg.particles; opt.cfg2.particles = opt.cfg.particles; }
+			else if (tok == "maxplies") { if (num("maxplies", 1, 100000, x)) opt.maxPlies = int(x); }
 			else if (tok == "verbose") opt.verbose = true;
-			else if (tok == "maxplies") is >> opt.maxPlies;
+			else if (tok == "budget") {
+				if (num("budget", 1, 3600000, x))
+					opt.cfg.budgetMs = opt.cfg2.budgetMs = int(x);
+			}
+			else if (tok == "particles") {
+				if (num("particles", 1, 100000, x))
+					opt.cfg.particles = opt.cfg2.particles = int(x);
+			}
+			else if (tok == "seed") {
+				if (num("seed", 0, INT64_MAX, x))
+					opt.seed = uint64_t(x);
+			}
 			// A/B比較: 片側だけ設定を変えて同一バイナリ内で対戦させる
 			else if (tok == "p1cfg" || tok == "p2cfg") {
 				std::string k, v;
-				is >> k >> v;
-				if (!set_config_key(tok == "p1cfg" ? opt.cfg : opt.cfg2, k, v))
+				if (!(is >> k) || !(is >> v)) {
+					sync_cout << "info string bad arena option: " << tok
+					          << " needs <key> <value>" << sync_endl;
+					bad = true;
+				} else if (k == "seed") {
+					// 局ごとに振り直すので片側だけ固定はできない。`arena seed N` を使う
+					sync_cout << "info string " << tok
+					          << " seed is ignored (use `arena seed N`)" << sync_endl;
+					bad = true;
+				} else if (!set_config_key(tok == "p1cfg" ? opt.cfg : opt.cfg2, k, v)) {
 					sync_cout << "info string bad option: " << k << " = " << v << sync_endl;
+					bad = true;
+				}
 			}
+			else {
+				sync_cout << "info string unknown arena option: " << tok << sync_endl;
+				bad = true;
+			}
+		}
+		if (bad) {
+			sync_cout << "info string arena aborted" << sync_endl;
+			return;
 		}
 		run_arena(opt);
 	}

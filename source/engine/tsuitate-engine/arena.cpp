@@ -81,8 +81,13 @@ struct BeliefPlayer : IPlayer {
 	// 審判の完全情報と信念を突き合わせる(診断専用。思考には一切使わない)
 	void observe_truth(const Position& truth) override {
 		const auto& parts = core.belief().particles();
-		if (parts.empty())
+		if (parts.empty()) {
+			// 粒子が1つもない手番を数えないと、信念が壊れやすい設定ほど
+			// 都合の悪い手番だけが標本から抜けて king_acc / occ_rec が良く見える。
+			// 「1つも当てられていない」= 0 として数える。
+			g_stats[slot].truthSamples++;
 			return;
+		}
 		const Color opp     = ~core.view().us;
 		const Square trueK  = truth.square<KING>(opp);
 		uint64_t     trueOcc[2] = {};  // 相手駒の占有(81bitを2ワードに)
@@ -111,7 +116,10 @@ struct BeliefPlayer : IPlayer {
 			st.occAccSum += double(occHit) / double(parts.size()) / double(trueN);
 		st.truthSamples++;
 	}
-	// 選んだ手が実際に合法だったか(p_legalの較正=Brierスコア)
+	// 選んだ手が実際に合法だったか(p_legalの較正=Brierスコア)。
+	// king_acc / occ_rec と同じく1手番につき1回だけ数える(呼び出し側で制御)。
+	// 反則のやり直しまで数えると、反則が多い設定ほど標本が増えて
+	// 指標が反則率で重み付いてしまい、反則率とは別の証拠として使えなくなる。
 	void observe_verdict(bool wasLegal) override {
 		if (lastResult.best == Move::none() || lastResult.nParticles == 0)
 			return;
@@ -245,7 +253,8 @@ GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool v
 
 		// 審判: 通常将棋ルールでの合法性
 		const bool wasLegal = pos.pseudo_legal_s<true>(m) && pos.legal(m);
-		mover->observe_verdict(wasLegal);
+		if (!retryOfSameTurn)
+			mover->observe_verdict(wasLegal);
 		if (!wasLegal) {
 			fouls[side]++;
 			retryOfSameTurn = true;
