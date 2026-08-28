@@ -25,8 +25,9 @@ struct IPlayer {
 	virtual void on_our_foul(Move m) = 0;
 	virtual void on_opp_move(Square capSq, bool gaveCheck) = 0;
 	virtual void on_opp_foul() = 0;
-	// 診断用フック(審判だけが持つ完全情報を渡す。思考には使わない)
-	virtual void observe_truth(const Position&) {}
+	// 診断用フック(審判だけが持つ完全情報を渡す。思考には使わない)。
+	// どちらも1手番につき1回だけ呼ぶこと(反則のやり直しでは呼ばない)。
+	virtual void observe_turn(const Position&) {}
 	virtual void observe_verdict(bool /*wasLegal*/) {}
 };
 
@@ -37,17 +38,28 @@ struct IPlayer {
 //   king_acc … 相手玉のマスを当てている粒子の割合(信念の芯の鋭さ)
 //   occ_rec  … 真の相手駒のうち、粒子が正しいマスに置けている割合(再現率)
 //   brier    … p_legalの較正誤差(選んだ手の合法性の予測 vs 実際)。小さいほど良い
+//   foul_rate… 1回の着手決定が反則になった割合(fouls / decisions)
 struct ArenaStats {
-	long long thinks = 0, particleSum = 0, relaxSum = 0, zeroParticle = 0;
-	long long pLegalPctSum = 0;
+	// --- 決定ごと(反則のやり直しも1回と数える) ---
+	// 反則率 fouls/decisions は「1回の着手決定が反則になる割合」で、これは
+	// やり直しも込みで数えるのが正しい(偏りもない)。
+	long long decisions = 0;
 	long long fouls = 0, foulsAfterZero = 0, foulsAfterRelax = 0;
+
+	// --- 手番ごと(1手番につき1回だけ) ---
+	// 反則すると手番は変わらず同じ局面で指し直しになる。指し直しまで数えると
+	// 「反則が多い設定ほど、信念が痛んだ直後の思考を何度も数える」ことになり、
+	// 平均が反則率で重み付いてしまう。設定間で比べる指標はすべて手番単位で取る。
+	long long turns = 0;
+	long long particleSum = 0, relaxSum = 0, zeroParticle = 0, pLegalPctSum = 0;
+	long long relaxHist[4] = {};  // 緩和レベル別の手番数(3=合成粒子)
 	double    kingAccSum = 0, occAccSum = 0;
 	long long truthSamples = 0;
 	double    brierSum = 0;
 	long long brierSamples = 0;
-	long long relaxHist[4] = {};  // 緩和レベル別の思考回数(3=合成粒子)
-	void add(const ThinkResult& r) {
-		thinks++;
+
+	void add_turn(const ThinkResult& r) {
+		turns++;
 		particleSum += r.nParticles;
 		relaxSum += r.relaxLevel;
 		pLegalPctSum += (long long)(r.pLegal * 100);
@@ -74,12 +86,14 @@ struct BeliefPlayer : IPlayer {
 	void new_game(Color us) override { core.new_game(us, cfg); }
 	Move choose() override {
 		ThinkResult r = core.think(budgetMs);
-		g_stats[slot].add(r);
+		g_stats[slot].decisions++;
 		lastResult = r;
 		return r.best;
 	}
-	// 審判の完全情報と信念を突き合わせる(診断専用。思考には一切使わない)
-	void observe_truth(const Position& truth) override {
+	// 1手番につき1回だけ呼ばれる診断フック(思考には一切使わない)。
+	// 直前の choose() の結果と、審判だけが持つ完全情報を突き合わせる。
+	void observe_turn(const Position& truth) override {
+		g_stats[slot].add_turn(lastResult);
 		const auto& parts = core.belief().particles();
 		if (parts.empty()) {
 			// 粒子が1つもない手番を数えないと、信念が壊れやすい設定ほど
@@ -244,7 +258,7 @@ GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool v
 		// 比べることになり、この変更が効かせたい経路そのものを測り損ねる。
 		// pos は自分の着手前なので、真の盤としてはここでも同じもの。
 		if (!retryOfSameTurn)
-			mover->observe_truth(pos);
+			mover->observe_turn(pos);
 		if (m == Move::none()) {
 			stat.winner = 1 - side;
 			stat.reason = "resign";
@@ -259,6 +273,10 @@ GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool v
 			fouls[side]++;
 			retryOfSameTurn = true;
 			mover->on_our_foul(m);
+			// 相手の反則はサイトから両者に通知される(ブリッジは oppfoul を送る)。
+			// アリーナだけ通知していなかったため、view.oppFouls が常に0のままで、
+			// 相手の反則累計を見る foulOppW が「唯一A/Bできる場所」で無効化されていた。
+			other->on_opp_foul();
 			if (fouls[side] >= MAX_FOULS) {
 				stat.winner = 1 - side;
 				stat.reason = "foul_limit";
@@ -336,16 +354,18 @@ void run_arena(const ArenaOptions& opt) {
 	          << ", elapsed=" << (now() - t0) / 1000 << "s" << std::endl;
 	for (int k = 0; k < 2; ++k) {
 		const ArenaStats& g = g_stats[k];
-		if (g.thinks == 0)
+		if (g.decisions == 0)
 			continue;
+		const long long T = g.turns ? g.turns : 1;
 		std::cout << "  belief diag[" << (k == 0 ? opt.p1 : opt.p2) << "#" << (k + 1) << "]:"
-		          << " thinks=" << g.thinks
-		          << " avg_particles=" << (g.particleSum / g.thinks)
+		          << " turns=" << g.turns << " decisions=" << g.decisions
+		          << " avg_particles=" << (g.particleSum / T)
 		          << " relax(0/1/2/synth)=" << g.relaxHist[0] << "/" << g.relaxHist[1]
 		          << "/" << g.relaxHist[2] << "/" << g.relaxHist[3]
 		          << " zero_particle=" << g.zeroParticle
-		          << " avg_p_legal=" << (g.pLegalPctSum / g.thinks) << "%"
+		          << " avg_p_legal=" << (g.pLegalPctSum / T) << "%"
 		          << " fouls=" << g.fouls
+		          << " foul_rate=" << (100.0 * double(g.fouls) / double(g.decisions ? g.decisions : 1)) << "%"
 		          << " (after_zero=" << g.foulsAfterZero
 		          << " after_relax=" << g.foulsAfterRelax << ")";
 		if (g.truthSamples)

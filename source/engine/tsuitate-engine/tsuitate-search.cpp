@@ -330,9 +330,23 @@ private:
 		std::string tok;
 		while (!bad && is >> tok) {
 			long long x = 0;
+			// プレイヤー種別も検証する。素の `is >> opt.p1` だと、綴りを間違えても
+			// make_player が黙って heuristic を返し、結果行にはその綴りが
+			// 相手名として出るので「beliefと対戦したつもりが内蔵bot相当だった」
+			// という取り違えに気づけない。
+			auto kind = [&](const char* name, std::string& out) {
+				std::string v;
+				if (!(is >> v) || (v != "belief" && v != "heuristic")) {
+					sync_cout << "info string bad arena option: " << name << " = " << v
+					          << " (belief | heuristic)" << sync_endl;
+					bad = true;
+					return;
+				}
+				out = v;
+			};
 			if (tok == "games") { if (num("games", 1, 100000, x)) opt.games = int(x); }
-			else if (tok == "p1") is >> opt.p1;
-			else if (tok == "p2") is >> opt.p2;
+			else if (tok == "p1") kind("p1", opt.p1);
+			else if (tok == "p2") kind("p2", opt.p2);
 			else if (tok == "maxplies") { if (num("maxplies", 1, 100000, x)) opt.maxPlies = int(x); }
 			else if (tok == "verbose") opt.verbose = true;
 			else if (tok == "budget") {

@@ -849,7 +849,12 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 	// 確保」のためだけに使う。
 	size_t want    = size_t(cfg_.particles);
 	size_t hardMin = std::max<size_t>(8, want / 16);
-	if (parts_.size() >= want * size_t(cfg_.regenFloorPct) / 100)
+	// regenFloorPct は「これだけ粒子が残っていれば再生成を省く」閾値だが、
+	// 低い値にすると再生成ラダーだけでなく最後の合成粒子フォールバックまで
+	// 素通りしてしまい、粒子ゼロで思考する手番が量産される
+	// (regenfloor 0 の実測: zero_particle 65/101、avg_p_legal 31%)。
+	// hardMin を下回っているときは閾値に関係なく必ず作り直す。
+	if (parts_.size() >= std::max(hardMin, want * size_t(cfg_.regenFloorPct) / 100))
 		return;
 
 	// 時間配分: 厳密(relax=0)に50%、relax=1に25%、relax=2に残り。
