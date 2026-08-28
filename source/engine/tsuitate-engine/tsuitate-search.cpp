@@ -273,12 +273,34 @@ private:
 			cmd_arena(is);
 		else if (cmd == "checkintents") {
 			// checkintents [games] [maxplies]
-			// 相手ノードが依存する不変条件(意図 ⊇ 合法手)のランダム検証
-			std::string a;
-			long long games = 200, plies = 120, x = 0;
-			if (is >> a && parse_ll(a, x) && x > 0 && x <= 100000) games = x;
-			if (is >> a && parse_ll(a, x) && x > 0 && x <= 100000) plies = x;
-			cmd_check_intents(games, plies);
+			// 相手ノードが依存する不変条件(意図 ⊇ 合法手)のランダム検証。
+			//
+			// 引数は必ず検証して報告する(このファイルの規約)。黙って既定値に
+			// 落とすと `checkintents 500000 200` が既定の200局を回して
+			// missing=0 を返し、「10万局で検証した」と誤読してしまう。
+			// 不変条件の検証コマンドが規模を偽るのは最悪の壊れ方。
+			long long games = 200, plies = 120;
+			bool bad = false;
+			auto arg = [&](const char* name, long long lo, long long hi, long long& out) {
+				std::string v;
+				if (!(is >> v))
+					return false;  // 省略は許す(既定値のまま)
+				long long x = 0;
+				if (!parse_ll(v, x) || x < lo || x > hi) {
+					sync_cout << "info string bad checkintents option: " << name
+					          << " = " << v << " (" << lo << ".." << hi << ")" << sync_endl;
+					bad = true;
+					return false;
+				}
+				out = x;
+				return true;
+			};
+			if (arg("games", 1, 100000, games))
+				arg("maxplies", 1, 100000, plies);
+			if (bad)
+				sync_cout << "info string checkintents aborted" << sync_endl;
+			else
+				cmd_check_intents(games, plies);
 		}
 		else
 			sync_cout << "info string unknown command: " << cmd << sync_endl;

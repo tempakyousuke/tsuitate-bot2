@@ -356,13 +356,23 @@ void run_arena(const ArenaOptions& opt) {
 			          << " は粒子数 " << want << " では下限 " << hardMin
 			          << " 個(=" << (100 * hardMin / (want ? want : 1))
 			          << "%)に床上げされます" << std::endl;
-		// blockcp が黙って無効化されると「効かないつまみをスイープしている」ことに
-		// 気づけない(A/Bが丸ごと無意味になる)。無効化の条件は think.cpp と揃える。
-		if (c.blockCp > 0.0 && c.oppModel > 0 && c.foulGainScale > 0.0)
-			std::cout << "info string note: p" << (k + 1) << " blockcp=" << c.blockCp
-			          << " は oppmodel=" << c.oppModel << " かつ foulgain=" << c.foulGainScale
-			          << " のとき無効化されます(相手ノードが同じ妨害の価値を数えるため)"
-			          << std::endl;
+		// blockcp が黙って無効化される/二重に効くと「効かないつまみをスイープして
+		// いる」ことに気づけない(A/Bが丸ごと無意味になる)。
+		// 条件は think.cpp の oppNodeCountsFouls と厳密に揃えること。
+		if (c.blockCp > 0.0 && c.oppModel > 0 && c.foulGainScale > 0.0) {
+			if (c.oppReplyKStage1 > 0)
+				std::cout << "info string note: p" << (k + 1) << " blockcp=" << c.blockCp
+				          << " は oppmodel=" << c.oppModel << " / foulgain=" << c.foulGainScale
+				          << " / oppreplykstage1=" << c.oppReplyKStage1
+				          << " のとき無効化されます(相手ノードが同じ妨害の価値を数えるため)"
+				          << std::endl;
+			else
+				std::cout << "info string note: p" << (k + 1) << " blockcp=" << c.blockCp
+				          << " は oppreplykstage1=0 なので有効なままですが、"
+				          << "stage2 の相手ノードも foulgain=" << c.foulGainScale
+				          << " で同じ妨害の価値を数えるため二重計上になります"
+				          << std::endl;
+		}
 	}
 
 	int p1Wins = 0, p2Wins = 0, draws = 0;

@@ -179,10 +179,15 @@ Value DSearch::opp_node(Position& pos, int depth, int ply) {
 	// 期待値ノードなのでαβ窓は使えない(どの子も重み付きで効くため打ち切れない)。
 	double expVal = 0;      // 相手視点の期待値
 	double maxVal = -1e18;  // 同じ集合の上での千里眼最善
-	// 「選んだ応手が相手の合法手を網羅していて、そのすべてが詰み」なら本物の詰み。
-	// top-k で間引いているときは網羅していないので詰みとは言えない。
-	bool  allMate    = true;
-	Value bestMateV  = -VALUE_INFINITE;  // 相手視点で最も粘れる詰み手順
+	// 「選んだ応手が相手の合法手を網羅していて、そのすべてが同じ決着」なら、
+	// 確率モデルによらず本物の詰み。top-k で間引いているときは網羅していないので
+	// 詰みとは言えない。どちら向きの詰みも保存する必要がある:
+	//   allWeMate   … どの応手でも相手が詰む(こちらの勝ち)
+	//   allTheyMate … どの応手でもこちらが詰まされる(こちらの負け)
+	bool  allWeMate   = true;
+	bool  allTheyMate = true;
+	Value bestMateV   = -VALUE_INFINITE;  // 相手視点で最も粘れる詰み手順
+	Value slowestMateV = VALUE_INFINITE;  // 相手視点で最も遅い「こちらを詰ます」手順
 	const bool exhaustive = sel.size() == legal.size();
 	for (uint32_t i : sel) {
 		StateInfo st;
@@ -192,7 +197,11 @@ Value DSearch::opp_node(Position& pos, int depth, int ply) {
 		if (v <= VALUE_MATED_IN_MAX_PLY)
 			bestMateV = std::max(bestMateV, v);
 		else
-			allMate = false;
+			allWeMate = false;
+		if (v >= VALUE_MATE_IN_MAX_PLY)
+			slowestMateV = std::min(slowestMateV, v);
+		else
+			allTheyMate = false;
 		// 「相手が3割の確率で詰みを見逃す」は大きな正の値であって詰みではない。
 		// 期待値に混ぜる前に飽和させておかないと、詰みスコアが確率で薄まった値が
 		// 詰みスコアの範囲に残って上位ノードの解釈を壊す。
@@ -201,12 +210,19 @@ Value DSearch::opp_node(Position& pos, int depth, int ply) {
 		maxVal = std::max(maxVal, s);
 	}
 
-	// 相手の合法手を全部読んで全部詰みだった = 確率モデルによらず本物の詰み。
+	// 相手の合法手を全部読んで全部同じ決着だった = 確率モデルによらず本物の詰み。
 	// ここで詰みスコアを返さないと、深いところで見つけた詰みが下の ±2500 クランプで
-	// 「ふつうの優勢」と同点になり、最終選択の乱数タイブレークが詰みを蹴りうる。
+	// 「ふつうの優勢/劣勢」と同点になり、最終選択の乱数タイブレーク(0〜4cp)が
+	// 詰みを蹴る・詰まされる筋を選ぶ、ということが起こる。
 	// 終盤は相手の合法手が k 以下に減ることが多いので、この経路は実際に効く。
-	if (exhaustive && allMate)
+	if (exhaustive && allWeMate)
 		return bestMateV;
+	// 逆向き: どの応手を選んでもこちらが詰まされるなら、相手の視界に関係なく負け。
+	// 非千里眼モデルでも「相手が詰みを見逃す」余地がない(全手が詰みなので、
+	// でたらめに指しても詰む)ので、これは確率の話ではなく確定した敗北。
+	// 最も遅い詰み(=相手が最善を逃した場合)を返して過度に悲観しないようにする。
+	if (exhaustive && allTheyMate)
+		return slowestMateV;
 
 	const double lambda = std::clamp(cfg->oppLambda, 0.0, 1.0);
 	double v = (1.0 - lambda) * expVal + lambda * maxVal;
@@ -223,7 +239,11 @@ Value DSearch::opp_node(Position& pos, int depth, int ply) {
 	v -= std::min(foulGain * eFoul, cfg->oppFoulMaxCp);
 
 	// 詰みスコアの範囲には入れない(この値は確率混合であって詰みの保証ではない)。
-	// 本物の詰みを返すのは上の mated_in と exhaustive&&allMate の2経路だけ。
+	// 本物の詰みを返すのは上の mated_in と exhaustive&&allWeMate /
+	// exhaustive&&allTheyMate の3経路だけ。
+	// なお「一部の応手だけが詰み」は詰みではない —— 相手にこちらの駒は見えないので、
+	// 詰ます手を選んでくれるとは限らないし、避けてくれるとも限らない。
+	// それは期待値として上の混合に入っているのが正しい。
 	return Value(int(std::clamp(v, -2500.0, 2500.0)));
 }
 

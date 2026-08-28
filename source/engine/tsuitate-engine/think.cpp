@@ -63,7 +63,12 @@ void block_map(const std::vector<ParticlePtr>& parts, Color us, size_t k,
 		// **同じ生成器**から取る。ここに独自の列挙を書くと、成り変種や
 		// 行き所のない駒の扱いが食い違って別の相手モデルになる
 		// (実際、以前はこの関数だけ成り変種と piece_can_stay を落としていた)。
-		enumerate_opp_intents(pos, opp, intents, pos.in_check(), cfg);
+		// inCheck は「**相手が**王手されているか」。粒子は常にこちらの手番なので、
+		// 相手が王手されていることは定義上ありえない(ありえたら相手の玉を
+		// 取れる不正な局面)。pos.in_check() はこちら側の王手状態を返すので、
+		// ここに渡すのは誤り。妨害マップが見ているのは「次の相手の手番に
+		// 何を指したいか」であり、そのときの王手状態は予測できないので false。
+		enumerate_opp_intents(pos, opp, intents, /*inCheck=*/false, cfg);
 		for (auto sq : SQ)
 			votes[sq] = 0.0;
 		double total = 0.0;  // 相手の「指したい手」の総数(正規化用)
@@ -225,13 +230,20 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	// 妨害マップ(相手の反則を誘う配置への加点)。合法だったときにだけ効くので
 	// p_legal を掛ける。移動元を空けるぶんは差し引く。
 	//
-	// 二重計上を避けるのは「探索の相手ノードが実際に反則の価値を数えているとき」
-	// = oppModel > 0 **かつ** foulGainScale > 0 のときだけ。
-	// foulGainScale = 0(既定)なら相手ノードは反則の価値を一切数えないので、
-	// ここで無効化すると妨害の価値がどこにも計上されなくなる。
-	// (oppModel == 1 では ply==1 の相手ノードしか modeling しないので、
-	//  それ以降の相手の手番に対する妨害の価値はそもそも数えられていない)
-	const bool oppNodeCountsFouls = cfg.oppModel > 0 && cfg.foulGainScale > 0.0;
+	// この加点を落としてよいのは、探索の相手ノードが同じ価値を
+	// **候補手の序列を決める段(stage1)でも**数えているときだけ。3条件が要る:
+	//   oppModel > 0        … 相手ノードを modeling している
+	//   foulGainScale > 0   … その相手ノードが反則の価値を実際に数えている
+	//   oppReplyKStage1 > 0 … stage1 でも相手ノードを展開している
+	// 3つ目が要るのは、上位 stage2TopK 手を切るのが stage1 だから。
+	// stage1 が千里眼qsearchのままだと、妨害の価値はstage1のどこにも入らず、
+	// 妨害が狙いの候補手は stage2 に到達する前に切り落とされる
+	// (= blockcp のA/Bが丸ごと無意味になる)。
+	//
+	// なお oppModel == 1 では ply==1 の相手ノードしか modeling しないので、
+	// それ以降の相手の手番に対する妨害の価値はどちらの経路でも数えていない。
+	const bool oppNodeCountsFouls =
+	    cfg.oppModel > 0 && cfg.foulGainScale > 0.0 && cfg.oppReplyKStage1 > 0;
 	std::vector<double> blockBonus(M, 0.0);
 	if (cfg.blockCp > 0.0 && !oppNodeCountsFouls && NP > 0) {
 		double map[SQ_NB];
