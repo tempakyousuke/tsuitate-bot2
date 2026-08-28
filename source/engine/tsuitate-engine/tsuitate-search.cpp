@@ -122,7 +122,10 @@ bool set_config_key(Config& c, const std::string& key, const std::string& val) {
 	else if (key == "policyeps")    apply_d(c.policyEps, 0.0, 1.0);
 	else if (key == "foulbase")     apply_d(c.foulBaseCp, 0.0, 1e6);
 	else if (key == "foulstep")     apply_d(c.foulStepCp, 0.0, 1e6);
-	else if (key == "foulopp")      apply_d(c.foulOppW, 0.0, 100.0);
+	// foulOppW は 1 + w×oppFouls(最大10) の乗数で、10/(10-f) や緩和割増と
+	// 掛け合わさる。100 まで許すと反則コストが詰みスコアを桁で超えて
+	// 「合法でありさえすればよい」になるので、意味のある範囲に絞る。
+	else if (key == "foulopp")      apply_d(c.foulOppW, 0.0, 1.0);
 	else if (key == "plegalprior")  apply_d(c.pLegalPrior, 0.0, 1e6);
 	else if (key == "blockcp")      apply_d(c.blockCp, 0.0, 1e6);
 	else if (key == "seed") {
@@ -336,9 +339,15 @@ private:
 			// という取り違えに気づけない。
 			auto kind = [&](const char* name, std::string& out) {
 				std::string v;
-				if (!(is >> v) || (v != "belief" && v != "heuristic")) {
+				if (!(is >> v)) {
+					sync_cout << "info string bad arena option: " << name
+					          << " needs a value (" << player_kind_list() << ")" << sync_endl;
+					bad = true;
+					return;
+				}
+				if (!valid_player_kind(v)) {
 					sync_cout << "info string bad arena option: " << name << " = " << v
-					          << " (belief | heuristic)" << sync_endl;
+					          << " (" << player_kind_list() << ")" << sync_endl;
 					bad = true;
 					return;
 				}

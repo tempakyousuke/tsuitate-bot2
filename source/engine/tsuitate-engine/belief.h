@@ -28,6 +28,10 @@ struct Particle {
 	std::deque<StateInfo> sts;       // do_moveごとに1つ(先頭は初期局面用)
 	std::vector<Move>     oppMoves;  // この粒子が選んだ相手手(リプレイ用)
 	bool                  synthetic = false;  // 履歴リプレイ不能な合成粒子(緊急ビリーフ)
+	// この粒子がどれだけ観測と厳密かを表す緩和レベル
+	// (0=全制約を満たすリプレイ / 1,2=制約を外したリプレイ / 3=合成粒子)。
+	// 信念全体の品質はこれを粒子集合から集計して決める(relax_level_of_set)。
+	int                   relax = 0;
 
 	Particle() { init(); }
 
@@ -35,6 +39,7 @@ struct Particle {
 		sts.clear();
 		oppMoves.clear();
 		synthetic = false;
+		relax = 0;
 		sts.emplace_back();
 		pos.set_hirate(&sts.back());
 	}
@@ -44,6 +49,7 @@ struct Particle {
 		sts.clear();
 		oppMoves.clear();
 		synthetic = true;
+		relax = 3;
 		sts.emplace_back();
 		return !pos.set(sfen, &sts.back()).has_value();
 	}
@@ -79,7 +85,9 @@ public:
 
 	const std::vector<ParticlePtr>& particles() const { return parts_; }
 	size_t size() const { return parts_.size(); }
+	// 診断表示用の整数レベル(0..3)。思考には relax_mean() のほうを使う。
 	int    relaxLevel() const { return relaxLevel_; }
+	double relaxMean() const { return relaxMean_; }
 	size_t cursor() const { return cursor_; }
 
 private:
@@ -105,6 +113,14 @@ private:
 	// 特定の1手だけの整合判定(全合法手の列挙を伴わない高速版)
 	static bool opp_move_consistent(const Particle& p, const HistEvent& ev,
 	                                Move m, int relax);
+
+	// 粒子集合から信念全体の緩和度を決める(粒子ごとの relax の平均)。
+	//
+	// 連続値にしているのは、think() の反則コスト割増がこれに比例するため。
+	// 「非厳密な粒子が過半なら最悪レベル」のような階段にすると、
+	// 50%の境界をまたいだだけで割増が 1.0倍 ⇔ 5.5倍 と飛び、
+	// その境界付近を動かすA/Bが解釈できなくなる。
+	double relax_mean() const;
 
 	// 方策で1手選ぶ。excludeに入っている手は除く。
 	// cfg_.oppPolicy で相手モデルを切り替える(0=千里眼評価softmax / 1=非千里眼prior)。
@@ -133,6 +149,7 @@ private:
 	long long                failKind_[4]  = {};  // 再生成失敗イベント種別の分布
 	size_t                   cursor_     = 0;  // histのうち適用済みイベント数
 	int                      relaxLevel_ = 0;  // 現在の粒子群の緩和レベル(観測指標)
+	double                   relaxMean_  = 0;  // 同上の連続値(反則コスト割増に使う)
 };
 
 } // namespace Tsuitate

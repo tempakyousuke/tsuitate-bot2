@@ -33,6 +33,14 @@ struct ArenaOptions {
 // 対戦を実行し、結果をstdoutへ出力する
 void run_arena(const ArenaOptions& opt);
 
+// 有効なプレイヤー種別か。make_player の分岐と同じ集合をここ1か所で持つ。
+// (パーサ側にリストを複製すると、種別を増やしたときに片方だけ直して
+//  「beliefと対戦したつもりが内蔵bot相当だった」という取り違えに戻る)
+bool valid_player_kind(const std::string& kind);
+
+// 種別の一覧(エラーメッセージ用)
+const char* player_kind_list();
+
 } // namespace Tsuitate
 } // namespace YaneuraOu
 

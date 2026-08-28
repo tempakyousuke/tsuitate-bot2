@@ -238,7 +238,9 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	foulCp *= 1.0 + cfg.foulOppW * view.oppFouls;
 	// 信念の品質が悪い(緩和粒子・粒子不足)ときはp_legalの推定が信用できないので、
 	// リスクをさらに重く見る。反則→粒子死→さらに反則、のスパイラルを断つ。
-	foulCp *= 1.0 + 1.5 * belief.relaxLevel();
+	// 緩和度は粒子集合の平均(連続値)。整数レベルで掛けると、
+	// 粒子の入れ替わりで境界をまたいだだけで割増が飛んでしまう。
+	foulCp *= 1.0 + 1.5 * belief.relaxMean();
 	if (NP * 4 < size_t(cfg.particles))
 		foulCp *= 2.0;
 

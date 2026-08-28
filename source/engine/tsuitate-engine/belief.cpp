@@ -18,11 +18,21 @@ void Belief::reset(Color us, const Config& cfg) {
 	rng_ = PRNG(cfg.seed);
 	cursor_ = 0;
 	relaxLevel_ = 0;
+	relaxMean_  = 0;
 	parts_.clear();
 	graveyard_.clear();
 	curFouls_.clear();
 	for (int i = 0; i < cfg_.particles; ++i)
 		parts_.push_back(std::make_unique<Particle>());
+}
+
+double Belief::relax_mean() const {
+	if (parts_.empty())
+		return 0.0;
+	long long sum = 0;
+	for (const auto& p : parts_)
+		sum += p->relax;
+	return double(sum) / double(parts_.size());
 }
 
 void Belief::bury(const Particle& p) {
@@ -187,6 +197,7 @@ Move Belief::sample_policy(Particle& p, const std::vector<Move>& moves,
 
 ParticlePtr Belief::clone_of(const GameHistory& hist, const Particle& src) {
 	auto p = std::make_unique<Particle>();
+	p->relax = src.relax;
 	size_t k = 0;
 	for (size_t i = 0; i < cursor_; ++i) {
 		const HistEvent& ev = hist.events[i];
@@ -727,7 +738,9 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 void Belief::force_resynthesize(const OwnView& view, TimePoint deadline) {
 	parts_.clear();
 	int misses = 0;
-	size_t target = std::max<size_t>(16, size_t(cfg_.particles) / 4);
+	// particles を小さくしたときに設定値を超えて作らないよう頭打ちにする
+	size_t target = std::min(size_t(cfg_.particles),
+	                         std::max<size_t>(16, size_t(cfg_.particles) / 4));
 	// synthesize は1回あたり最大30試行回るので、回数だけでなく時計でも止める
 	// (sync が予算を使ったあとに呼ばれるため、ここで時間切れを起こしうる)。
 	while (parts_.size() < target && misses < 400) {
@@ -742,7 +755,8 @@ void Belief::force_resynthesize(const OwnView& view, TimePoint deadline) {
 		else
 			++misses;
 	}
-	relaxLevel_ = 3;
+	relaxMean_  = relax_mean();
+	relaxLevel_ = int(relaxMean_ + 0.5);
 }
 
 ParticlePtr Belief::replay_one(const GameHistory& hist, int relax,
@@ -818,6 +832,7 @@ ParticlePtr Belief::replay_one(const GameHistory& hist, int relax,
 		}
 		}
 	}
+	p->relax = relax;
 	return p;
 }
 
@@ -847,15 +862,25 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 	// 緩和(relax>0)した粒子は観測と部分的に矛盾していて合法率の推定を汚すので、
 	// 目標数(want)へは厳密粒子のみで向かい、緩和は「最低限の粒子数(hardMin)の
 	// 確保」のためだけに使う。
-	size_t want    = size_t(cfg_.particles);
-	size_t hardMin = std::max<size_t>(8, want / 16);
+	size_t want = size_t(cfg_.particles);
+	// 最低限確保したい粒子数。want 自体を超えないよう頭打ちにすること
+	//(particles は1まで設定できるので、max(8, want/16) だけだと want < 8 のとき
+	// 「絶対に満たせない下限」になり、毎手ラダーを空回りさせたうえで
+	// 合成粒子だけの信念(relaxLevel_=3 固定)に落ちてしまう)。
+	size_t hardMin = std::min(want, std::max<size_t>(8, want / 16));
 	// regenFloorPct は「これだけ粒子が残っていれば再生成を省く」閾値だが、
 	// 低い値にすると再生成ラダーだけでなく最後の合成粒子フォールバックまで
 	// 素通りしてしまい、粒子ゼロで思考する手番が量産される
 	// (regenfloor 0 の実測: zero_particle 65/101、avg_p_legal 31%)。
 	// hardMin を下回っているときは閾値に関係なく必ず作り直す。
-	if (parts_.size() >= std::max(hardMin, want * size_t(cfg_.regenFloorPct) / 100))
+	if (parts_.size() >= std::max(hardMin, want * size_t(cfg_.regenFloorPct) / 100)) {
+		// 再生成しなくても品質は必ず測り直す。ここを素通りすると前の手番の
+		// relaxLevel_(最悪3=合成)が残り、think() の反則コスト割増が
+		// 「いまは厳密な粒子しかない手番」にも掛かってしまう。
+		relaxMean_  = relax_mean();
+		relaxLevel_ = int(relaxMean_ + 0.5);
 		return;
+	}
 
 	// 時間配分: 厳密(relax=0)に50%、relax=1に25%、relax=2に残り。
 	// 失敗回数でも時間でも先に尽きたほうでエスカレーションする。
@@ -916,7 +941,8 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 			failKind_[size_t(hist.events[failIdx].kind)]++;
 		}
 	}
-	relaxLevel_ = relax;
+	relaxMean_  = relax_mean();
+	relaxLevel_ = int(relaxMean_ + 0.5);
 
 	// 最終フォールバック: 合成粒子(常に成功する)。
 	// リプレイでは再現できない稀な相手の指し回しに遭遇したときの保険で、
@@ -931,8 +957,8 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 			else
 				++misses;
 		}
-		if (!parts_.empty())
-			relaxLevel_ = 3;
+		relaxMean_  = relax_mean();
+		relaxLevel_ = int(relaxMean_ + 0.5);
 	}
 
 	if (parts_.empty() && cfg_.logLevel >= 1) {

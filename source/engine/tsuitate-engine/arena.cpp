@@ -39,11 +39,18 @@ struct IPlayer {
 //   occ_rec  … 真の相手駒のうち、粒子が正しいマスに置けている割合(再現率)
 //   brier    … p_legalの較正誤差(選んだ手の合法性の予測 vs 実際)。小さいほど良い
 //   foul_rate… 1回の着手決定が反則になった割合(fouls / decisions)
+//
+// 手番ごとの指標(avg_particles / avg_p_legal / relax / king_acc / occ_rec / brier)と
+// 決定ごとの指標(foul_rate / after_zero / after_relax)は分母が違う。
+// 出力にはどちらの分母も出す(turns= と decisions=)。
 struct ArenaStats {
 	// --- 決定ごと(反則のやり直しも1回と数える) ---
 	// 反則率 fouls/decisions は「1回の着手決定が反則になる割合」で、これは
 	// やり直しも込みで数えるのが正しい(偏りもない)。
+	// 反則の帰属(after_zero / after_relax)も決定ごとなので、比較できるように
+	// 「そのとき粒子ゼロだった決定数 / 緩和状態だった決定数」を分母として持つ。
 	long long decisions = 0;
+	long long decisionsAtZero = 0, decisionsAtRelax = 0;
 	long long fouls = 0, foulsAfterZero = 0, foulsAfterRelax = 0;
 
 	// --- 手番ごと(1手番につき1回だけ) ---
@@ -51,18 +58,25 @@ struct ArenaStats {
 	// 「反則が多い設定ほど、信念が痛んだ直後の思考を何度も数える」ことになり、
 	// 平均が反則率で重み付いてしまう。設定間で比べる指標はすべて手番単位で取る。
 	long long turns = 0;
-	long long particleSum = 0, relaxSum = 0, zeroParticle = 0, pLegalPctSum = 0;
+	long long particleSum = 0, zeroParticle = 0;
+	double    pLegalSum = 0;     // 整数%で持つと二重に切り捨てて0.5pp沈むのでdoubleで持つ
 	long long relaxHist[4] = {};  // 緩和レベル別の手番数(3=合成粒子)
 	double    kingAccSum = 0, occAccSum = 0;
 	long long truthSamples = 0;
 	double    brierSum = 0;
 	long long brierSamples = 0;
 
+	void add_decision(const ThinkResult& r) {
+		decisions++;
+		if (r.nParticles == 0)
+			decisionsAtZero++;
+		else if (r.relaxLevel > 0)
+			decisionsAtRelax++;
+	}
 	void add_turn(const ThinkResult& r) {
 		turns++;
 		particleSum += r.nParticles;
-		relaxSum += r.relaxLevel;
-		pLegalPctSum += (long long)(r.pLegal * 100);
+		pLegalSum += r.pLegal;
 		if (r.nParticles == 0)
 			zeroParticle++;
 		if (r.relaxLevel >= 0 && r.relaxLevel < 4)
@@ -86,7 +100,7 @@ struct BeliefPlayer : IPlayer {
 	void new_game(Color us) override { core.new_game(us, cfg); }
 	Move choose() override {
 		ThinkResult r = core.think(budgetMs);
-		g_stats[slot].decisions++;
+		g_stats[slot].add_decision(r);
 		lastResult = r;
 		return r.best;
 	}
@@ -135,6 +149,10 @@ struct BeliefPlayer : IPlayer {
 	// 反則のやり直しまで数えると、反則が多い設定ほど標本が増えて
 	// 指標が反則率で重み付いてしまい、反則率とは別の証拠として使えなくなる。
 	void observe_verdict(bool wasLegal) override {
+		// 粒子ゼロの手番は「p_legal の予測そのものが存在しない」ので数えられない
+		//(think() はヒューリスティックに落ちて pLegal を既定の0のまま返す)。
+		// ただし除外したぶん母集団が設定によって変わるので、brier_n を出力して
+		// どれだけ落としたかが分かるようにする(turns と突き合わせれば分かる)。
 		if (lastResult.best == Move::none() || lastResult.nParticles == 0)
 			return;
 		double d = lastResult.pLegal - (wasLegal ? 1.0 : 0.0);
@@ -217,6 +235,7 @@ std::unique_ptr<IPlayer> make_player(const std::string& kind, const ArenaOptions
 		c.seed   = seed;
 		return std::make_unique<BeliefPlayer>(c, c.budgetMs, slot);
 	}
+	// ここに来るのは "heuristic" だけ(valid_player_kind が入口で弾いている)
 	return std::make_unique<HeuristicPlayer>(seed);
 }
 
@@ -315,7 +334,30 @@ GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool v
 
 } // namespace
 
+bool valid_player_kind(const std::string& kind) {
+	return kind == "belief" || kind == "heuristic";
+}
+
+const char* player_kind_list() { return "belief | heuristic"; }
+
 void run_arena(const ArenaOptions& opt) {
+	// regenfloor は hardMin = min(particles, max(8, particles/16)) で床上げされる。
+	// 黙って効かない値でスイープすると「このつまみは無反応」と誤読するので、
+	// 実効値が設定値と違うときは明示する。
+	for (int k = 0; k < 2; ++k) {
+		const Config& c = k == 0 ? opt.cfg : opt.cfg2;
+		if ((k == 0 ? opt.p1 : opt.p2) != "belief")
+			continue;
+		size_t want    = size_t(c.particles);
+		size_t hardMin = std::min(want, std::max<size_t>(8, want / 16));
+		size_t asked   = want * size_t(c.regenFloorPct) / 100;
+		if (asked < hardMin)
+			std::cout << "info string note: p" << (k + 1) << " regenfloor=" << c.regenFloorPct
+			          << " は粒子数 " << want << " では下限 " << hardMin
+			          << " 個(=" << (100 * hardMin / (want ? want : 1))
+			          << "%)に床上げされます" << std::endl;
+	}
+
 	int p1Wins = 0, p2Wins = 0, draws = 0;
 	long long p1Fouls = 0, p2Fouls = 0, plies = 0;
 	TimePoint t0 = now();
@@ -356,23 +398,28 @@ void run_arena(const ArenaOptions& opt) {
 		const ArenaStats& g = g_stats[k];
 		if (g.decisions == 0)
 			continue;
-		const long long T = g.turns ? g.turns : 1;
+		// decisions == 0 の行は上で弾いてあり、decisions >= 1 なら
+		// observe_turn も必ず1回は走っているので turns >= 1。ゼロ除算はない。
+		const double T = double(g.turns);
 		std::cout << "  belief diag[" << (k == 0 ? opt.p1 : opt.p2) << "#" << (k + 1) << "]:"
 		          << " turns=" << g.turns << " decisions=" << g.decisions
-		          << " avg_particles=" << (g.particleSum / T)
+		          << " avg_particles=" << (double(g.particleSum) / T)
 		          << " relax(0/1/2/synth)=" << g.relaxHist[0] << "/" << g.relaxHist[1]
 		          << "/" << g.relaxHist[2] << "/" << g.relaxHist[3]
 		          << " zero_particle=" << g.zeroParticle
-		          << " avg_p_legal=" << (g.pLegalPctSum / T) << "%"
+		          << " avg_p_legal=" << (100.0 * g.pLegalSum / T) << "%"
 		          << " fouls=" << g.fouls
-		          << " foul_rate=" << (100.0 * double(g.fouls) / double(g.decisions ? g.decisions : 1)) << "%"
-		          << " (after_zero=" << g.foulsAfterZero
-		          << " after_relax=" << g.foulsAfterRelax << ")";
+		          << " foul_rate=" << (100.0 * double(g.fouls) / double(g.decisions)) << "%"
+		          // 帰属は決定ごと。分母も決定ごとで出さないと手番単位の
+		          // zero_particle / relax(...) と突き合わせられない
+		          << " (after_zero=" << g.foulsAfterZero << "/" << g.decisionsAtZero
+		          << " after_relax=" << g.foulsAfterRelax << "/" << g.decisionsAtRelax << ")";
 		if (g.truthSamples)
 			std::cout << " king_acc=" << (100.0 * g.kingAccSum / double(g.truthSamples)) << "%"
 			          << " occ_rec=" << (100.0 * g.occAccSum / double(g.truthSamples)) << "%";
 		if (g.brierSamples)
-			std::cout << " brier=" << (g.brierSum / double(g.brierSamples));
+			std::cout << " brier=" << (g.brierSum / double(g.brierSamples))
+			          << " brier_n=" << g.brierSamples;
 		std::cout << std::endl;
 	}
 	g_stats[0] = ArenaStats();
