@@ -306,7 +306,9 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 			else
 				v = -ds.qsearch(pos, -VALUE_INFINITE, VALUE_INFINITE, 1);
 			pos.undo_move(cands[i]);
-			sum += squash_cp(v);
+			// 相手ノードが確率混合を返したときは、その値は既に squash 済みの空間に
+			// いるので二重に squash しない(詰みが通常評価の上限に潰れる)。
+			sum += ds.rootMixed ? double(v) : squash_cp(v);
 		}
 		mean1[i] = sel.empty() ? 0.0 : sum / double(sel.size());
 		comb1[i] = combined(i, mean1[i]);
@@ -346,7 +348,8 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 				pos.do_move(cands[i], st);
 				Value v = -ds.search(pos, d - 1, -VALUE_INFINITE, VALUE_INFINITE, 1);
 				pos.undo_move(cands[i]);
-				sum += squash_cp(v);
+				// 上と同じ理由で、混合値は二重に squash しない
+				sum += ds.rootMixed ? double(v) : squash_cp(v);
 				++cnt;
 			}
 			pass[i] = cnt > 0 ? combined(i, sum / double(cnt)) : comb1[i];

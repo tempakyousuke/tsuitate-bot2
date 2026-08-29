@@ -34,6 +34,20 @@ struct DSearch {
 	double        foulGain = 0.0;
 	int           oppK1    = 0;
 
+	// ply==1 の相手ノードが「確率混合の値」を返したか(呼び出しごとに1回だけ立つ)。
+	//
+	// 混合値は子を squash_cp してから重み付けしたもので、**すでに squash 済みの空間**
+	// (詰み=±3000 / 通常=±2500 のスケール)にいる。think() が返り値にもう一度
+	// squash_cp を掛けると、詰み寄りの値(2500超)が通常評価の上限 2500 に潰れて、
+	// **深いところで見つけた詰みが「ふつうの優勢」と区別できなくなる**。
+	// このフラグが立っているときは think() 側で二重に squash しないこと。
+	//
+	// 本物の詰みスコアを返す経路(mated_in / exhaustive な全詰み)ではフラグは
+	// 立たない。そちらは squash_cp を通して ±3000 になるのが正しい。
+	//
+	// ※ DSearch は1回の探索につき1つ作る前提(think() がループ内で毎回作る)。
+	bool          rootMixed = false;
+
 	// 手番側から見た評価値(centipawn相当, 詰みは±(32000-ply))を返す。
 	Value search(Position& pos, int depth, Value alpha, Value beta, int ply);
 	Value qsearch(Position& pos, Value alpha, Value beta, int ply);

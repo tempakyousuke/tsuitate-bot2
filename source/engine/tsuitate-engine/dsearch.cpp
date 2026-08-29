@@ -219,18 +219,24 @@ Value DSearch::opp_node(Position& pos, int depth, int ply) {
 	if (exhaustive && allWeMate)
 		return bestMateV;
 
-	// 逆向き(どの合法応手でもこちらが詰まされる)は **対称ではない**。
-	// 相手にはこちらの駒が見えないので、その詰ます合法手に辿り着く前に
-	// 反則を重ねる。exhaustive になるのは相手の合法手が少ない局面 = p_ok が
-	// 小さい局面なので、まさに相手が反則を量産する状況でもある。
-	// 相手の反則累計が多ければ、真の決着は「こちらの反則勝ち」でありうる。
-	// つまりこれは確定した敗北ではなく、下の混合(反則項つき)で評価すべき量。
+	// 逆向き(どの合法応手でもこちらが詰まされる)。
 	//
-	// ただし反則の価値を数えていない設定(foulGain == 0、既定)では、
-	// モデル上「相手の反則は無価値」なので詰みとして扱ってよい。
-	// この場合だけ短絡し、数えているときは混合に委ねて反則項を効かせる。
-	// 最も遅い詰みを返すのは、相手が最善の詰まし方を選ぶとは限らないため。
-	if (exhaustive && allTheyMate && foulGain <= 0.0)
+	// 厳密には確定した敗北ではない: 相手にはこちらの駒が見えないので、その詰ます
+	// 合法手に辿り着く前に反則を重ねうる。相手が反則予算(残り 10 − oppFouls 回)を
+	// 使い切れば、真の決着は「こちらの反則勝ち」になる。
+	//
+	// **しかしその逃げ道を反則項で埋め合わせてはいけない。** 一度そうしたところ、
+	//   確定詰み  → 3000 − min(foulGain·eFoul, oppFoulMaxCp) = 2200〜2300
+	//   ただの劣勢 → 2500(クランプ上限)
+	// となり、**確定で詰まされる筋がただの飛車損より高く評価される**逆転が起きた。
+	// 反則項は「1手番あたりの期待反則回数」(高々 oppFoulCap = 2回)しか見ておらず、
+	// 相手が反則負けするのに必要な残り10回ぶんの予算を表現していないので、
+	// 終端の敗北に対する割引としては桁が合わない。
+	//
+	// よってここは詰みスコアを返し、「相手が先に反則負けする」逃げ道は
+	// **モデル化しない**(既知の近似)。最も遅い詰みを返すのは、
+	// 盲目の相手が最善の詰まし方を選ぶとは限らないため。
+	if (exhaustive && allTheyMate)
 		return slowestMateV;
 
 	const double lambda = std::clamp(cfg->oppLambda, 0.0, 1.0);
@@ -248,12 +254,22 @@ Value DSearch::opp_node(Position& pos, int depth, int ply) {
 	v -= std::min(foulGain * eFoul, cfg->oppFoulMaxCp);
 
 	// 詰みスコアの範囲には入れない(この値は確率混合であって詰みの保証ではない)。
-	// 本物の詰みを返すのは上の mated_in(2か所)と exhaustive&&allWeMate、
-	// および foulGain==0 のときの exhaustive&&allTheyMate だけ。
+	// 本物の詰みを返すのは上の mated_in(2か所)と exhaustive&&allWeMate /
+	// exhaustive&&allTheyMate だけ。
 	// なお「一部の応手だけが詰み」は詰みではない —— 相手にこちらの駒は見えないので、
 	// 詰ます手を選んでくれるとは限らないし、避けてくれるとも限らない。
 	// それは期待値として上の混合に入っているのが正しい。
-	return Value(int(std::clamp(v, -2500.0, 2500.0)));
+	//
+	// ただし**クランプは squash_cp と同じ ±3000 まで許す**。ここを ±2500 に
+	// 潰していたため、ply=1 より深くで見つけた詰み(子が ±3000 で返ってくる)が
+	// 通常評価の上限と同じ値になり、oppmodel を有効にすると詰み筋が
+	// 「ふつうの優勢」に見えて選ばれなくなっていた
+	// (例: p_legal 0.95 の詰み 2375 < p_legal 1.0 のふつうの優勢 2500)。
+	// この値は既に squash 済みの空間にいるので、think() 側では rootMixed を見て
+	// 二重に squash しないこと。
+	if (ply == 1)
+		rootMixed = true;
+	return Value(int(std::clamp(v, -3000.0, 3000.0)));
 }
 
 Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply) {
