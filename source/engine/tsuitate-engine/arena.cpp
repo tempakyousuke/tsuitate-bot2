@@ -435,10 +435,15 @@ void run_arena(const ArenaOptions& opt) {
 	          << ", avg plies=" << (plies / n)
 	          << ", elapsed=" << (now() - t0) / 1000 << "s" << std::endl;
 	// 盤上決着の勝敗は「勝ちにいく力」の直接の指標。総合勝率と分けて見ること。
+	//
+	// この内訳は p1cfg/p2cfg のA/Bのために存在するので、種別名(両方とも "belief")
+	// だけでは勝った側が読めない。上の winner= と同じく p1/p2 を必ず添える。
+	const std::string n1 = "p1(" + opt.p1 + ")";
+	const std::string n2 = "p2(" + opt.p2 + ")";
 	std::cout << "  decided: board=" << boardGames
-	          << " (" << opt.p1 << " " << boardP1 << " - " << boardP2 << " " << opt.p2 << ")"
+	          << " (" << n1 << " " << boardP1 << " - " << boardP2 << " " << n2 << ")"
 	          << " foul=" << foulGames
-	          << " (" << opt.p1 << " " << foulP1 << " - " << foulP2 << " " << opt.p2 << ")"
+	          << " (" << n1 << " " << foulP1 << " - " << foulP2 << " " << n2 << ")"
 	          << " other=" << otherGames
 	          << " board_rate=" << (100.0 * boardGames / n) << "%" << std::endl;
 	for (int k = 0; k < 2; ++k) {
