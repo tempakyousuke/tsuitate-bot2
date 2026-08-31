@@ -21,6 +21,7 @@ import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { availableParallelism } from 'node:os';
 import { createInterface } from 'node:readline';
 import { io, type Socket } from 'socket.io-client';
 
@@ -110,6 +111,12 @@ class Engine {
 
 const engine = new Engine(enginePath);
 engine.send('usi');
+// 既定でCPUコアぶんのワーカースレッドを使う(§3.1 粒子並列。4コアで実効3.8倍)。
+// TSUITATE_ENGINE_OPTS に threads の指定があればそちらを優先する。
+if (!/(^|,)\s*threads[\s=:]/.test(engineOptions)) {
+	const n = Math.max(1, Math.min(availableParallelism(), 16));
+	engine.send(`set threads ${n}`);
+}
 for (const opt of engineOptions.split(',')) {
 	const kv = opt.trim();
 	if (kv) engine.send(`set ${kv.replace(/[=:]/g, ' ')}`);

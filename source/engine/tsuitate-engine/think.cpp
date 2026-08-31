@@ -239,6 +239,21 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	const double foulGain =
 	    cfg.foulGainScale * foul_value(cfg.foulBaseCp, cfg.foulStepCp, view.oppFouls);
 
+	// §3.2: 探索コンテキスト(置換表 + history)。ワーカースレッドごとに1つ。
+	// 世代を進めて前手番の値によるカットオフを無効化する(オーダリングには残る)。
+	const int nWorkers = std::max(1, cfg.threads);
+	if (cfg.tt) {
+		while (int(ctx_.size()) < nWorkers)
+			ctx_.push_back(std::make_unique<SearchContext>());
+		for (int w = 0; w < nWorkers; ++w) {
+			ctx_[w]->ensure();
+			ctx_[w]->new_search();
+		}
+	}
+	auto ctx_for = [&](int w) -> SearchContext* {
+		return cfg.tt ? ctx_[size_t(w)].get() : nullptr;
+	};
+
 	// 妨害マップ(相手の反則を誘う配置への加点)。合法だったときにだけ効くので
 	// p_legal を掛ける。移動元を空けるぶんは差し引く。
 	//
@@ -336,7 +351,8 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		for (auto& a : cnt1)
 			a.store(0, std::memory_order_relaxed);
 
-		run_workers(cfg.threads, [&](int) {
+		run_workers(cfg.threads, [&](int w) {
+			SearchContext* sctx = ctx_for(w);
 			uint64_t myNodes = 0;
 			while (true) {
 				if (aborted.load(std::memory_order_relaxed))
@@ -367,6 +383,7 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 					ds.cfg        = &cfg;
 					ds.us         = view.us;
 					ds.foulGain   = foulGain;
+					ds.ctx        = sctx;
 					pos.do_move(m, st);
 					Value v;
 					if (depth == 0) {
@@ -450,6 +467,7 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 			ds.cfg = &cfg;
 			ds.us = view.us;
 			ds.foulGain = foulGain;
+			ds.ctx = ctx_for(0);
 			ds.oppK1 = cfg.oppReplyKStage1;
 			pos.do_move(cands[i], st);
 			// stage1 は本来この一手ぶんの静止探索だけで粗く序列化する段。
@@ -517,6 +535,7 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 				ds.cfg        = &cfg;
 				ds.us         = view.us;
 				ds.foulGain   = foulGain;
+				ds.ctx        = ctx_for(0);
 				pos.do_move(cands[i], st);
 				Value v = -ds.search(pos, d - 1, -VALUE_INFINITE, VALUE_INFINITE, 1);
 				pos.undo_move(cands[i]);

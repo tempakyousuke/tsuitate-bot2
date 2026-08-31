@@ -13,6 +13,7 @@
 
 #include "tsuitate_common.h"
 #include "belief.h"
+#include "dsearch.h"
 
 #if defined(TSUITATE_ENGINE)
 
@@ -36,6 +37,12 @@ public:
 	ThinkResult think(const OwnView& view, Belief& belief, const GameHistory& hist,
 	                  const std::vector<Move>& foulTried, int budgetMs,
 	                  const Config& cfg, PRNG& rng);
+
+private:
+	// §3.2 ワーカースレッドごとの探索コンテキスト(置換表 + history)。
+	// cfg.tt != 0 のときだけ確保する。手番をまたいで保持し、世代で無効化する
+	// (詳細は dsearch.h の SearchContext)。
+	std::vector<std::unique_ptr<SearchContext>> ctx_;
 };
 
 // ---------------------------------------------------------------------------

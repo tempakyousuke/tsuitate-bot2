@@ -16,6 +16,56 @@
 namespace YaneuraOu {
 namespace Tsuitate {
 
+// ---------------------------------------------------------------------------
+// 探索コンテキスト(置換表 + history)。§3.2 探索の底上げ。
+// ---------------------------------------------------------------------------
+// DSearch は (候補手, 粒子) のジョブごとに使い捨てなので、ジョブをまたいで
+// 生かしたい状態はここに置く。**ワーカースレッドごとに1つ**持つ(ロック不要)。
+// 反復深化(stage2 の d=2,4,6…)は同じ部分木を深さを変えて読み直すので、
+// 前のパスの結果が置換表に残っていると枝刈りとオーダリングが大きく効く。
+//
+// 世代(gen)は think() の呼び出しごとに進める。値による枝刈り(カットオフ)は
+// **同世代のエントリだけ**に許す: 局面評価は手番内では純粋に (局面, 深さ) の
+// 関数だが、手番をまたぐと oppFouls に依存する項(foulGain)が変わりうるため。
+// 旧世代のエントリは指し手のオーダリングにだけ使う(こちらは値が古くても無害)。
+struct TTEntry {
+	uint64_t key   = 0;  // pos.key()(0 = 空きスロット)
+	int16_t  value = 0;  // value_to_tt 済み(詰みはply補正済み)
+	uint16_t move16 = 0; // 最善手(Move::raw()。オーダリング用)
+	int8_t   depth = -1;
+	uint8_t  bound = 0;  // 0=UPPER 1=LOWER 2=EXACT
+	uint8_t  gen   = 0;
+	uint8_t  pad   = 0;
+};
+static_assert(sizeof(TTEntry) == 16, "TTEntry should stay 16 bytes");
+
+struct SearchContext {
+	static constexpr size_t TT_BITS = 20;                  // 2^20 = 1M エントリ(16MB)
+	static constexpr int    HIST_MAX = 16384;              // history の飽和値
+	std::vector<TTEntry> tt;
+	// history[手番(0=BLACK)][Move::raw()]。quietの beta カットで depth^2 を加点
+	std::vector<int16_t> hist;
+	uint8_t              gen = 0;
+
+	void ensure() {
+		if (tt.empty()) {
+			tt.resize(size_t(1) << TT_BITS);
+			hist.assign(2 * 65536, 0);
+		}
+	}
+	// think() ごとに1回呼ぶ。世代を進めて前手番の値カットオフを無効化し、
+	// history は半減させる(減衰なしだと長い対局で飽和して序列の分解能が落ちる)。
+	void new_search() {
+		++gen;
+		for (auto& h : hist)
+			h = int16_t(h / 2);
+	}
+	TTEntry& slot(uint64_t key) { return tt[key & ((size_t(1) << TT_BITS) - 1)]; }
+	int16_t& hist_of(Color side, uint16_t raw16) {
+		return hist[(side == BLACK ? 0 : 65536) + raw16];
+	}
+};
+
 struct DSearch {
 	// nodesLimit: このノード数を超えたら打ち切って静的評価を返す(粒子1つ分の保険)
 	uint64_t nodes      = 0;
@@ -33,6 +83,12 @@ struct DSearch {
 	Color         us       = COLOR_NB;
 	double        foulGain = 0.0;
 	int           oppK1    = 0;
+
+	// --- §3.2 置換表 + オーダリング(cfg->tt != 0 のときだけ think() が設定する) ---
+	// nullptr なら従来の探索(MVV-LVAのみ)と完全に同一の経路。
+	// killer はジョブ内(この DSearch の探索木)ローカルなのでここに持つ。
+	SearchContext* ctx = nullptr;
+	Move           killer[MAX_PLY][2] = {};  // ゼロ初期化 = Move::none()(MOVE_NONE==0)
 
 	// ply==1 の相手ノードが「確率混合の値」を返したか(呼び出しごとに1回だけ立つ)。
 	//
