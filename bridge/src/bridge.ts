@@ -116,6 +116,11 @@ engine.send('usi');
 if (!/(^|,)\s*threads[\s=:]/.test(engineOptions)) {
 	const n = Math.max(1, Math.min(availableParallelism(), 16));
 	engine.send(`set threads ${n}`);
+	// 並列時は思考予算の配分を信念側へ寄せる(syncpct 40 → 55)。
+	// 探索だけ4倍にすると攻撃性と反則コストの均衡が壊れる(60局で43.3%)が、
+	// 増えた計算の一部を信念に戻すと 66.7%(z=+2.84)でゲート通過
+	// (docs/strengthening.md 3.4章)。syncpct の明示指定があれば優先する。
+	if (n > 1 && !/(^|,)\s*syncpct[\s=:]/.test(engineOptions)) engine.send('set syncpct 55');
 }
 for (const opt of engineOptions.split(',')) {
 	const kv = opt.trim();
