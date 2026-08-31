@@ -280,7 +280,14 @@ GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool v
 			mover->observe_turn(pos);
 		if (m == Move::none()) {
 			stat.winner = 1 - side;
-			stat.reason = "resign";
+			// 投了の理由を区別する。think() は「この手番で反則になった手を除いた
+			// 候補」が空になると Move::none() を返すので、**反則で候補を使い切った**
+			// 投了は反則負けと同じ性質の決着であって盤上の決着ではない。
+			// 残り反則予算より候補が少ない終盤では、反則累計が10に達する前に
+			// こちらが先に起こりうる。
+			// これを盤上決着に数えると、この施策の主要指標である board_rate が
+			// 「反則の消耗戦」を混ぜて水増しされてしまう。
+			stat.reason = retryOfSameTurn ? "resign_after_fouls" : "resign";
 			break;
 		}
 
@@ -406,7 +413,9 @@ void run_arena(const ArenaOptions& opt) {
 		// 決着理由の内訳。反則負け以外で終わった局が「盤上で決着した局」。
 		if (st.winner == -1) {
 			otherGames++;
-		} else if (st.reason == "foul_limit") {
+		} else if (st.reason == "foul_limit" || st.reason == "resign_after_fouls") {
+			// resign_after_fouls = 反則で候補を使い切った投了。反則の消耗戦の結果なので
+			// 盤上決着に数えない(board_rate が水増しされる)
 			foulGames++;
 			(p1Won ? foulP1 : foulP2)++;
 		} else {

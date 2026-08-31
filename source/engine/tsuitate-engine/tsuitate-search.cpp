@@ -324,6 +324,24 @@ private:
 		core_.new_game(us, cfg_);
 		inGame_ = true;
 		sync_cout << "info string new game as " << (us == BLACK ? "sente" : "gote") << sync_endl;
+		// 設定が確定するのは対局開始時(`set` は1キーずつなので順序に依存する)。
+		// blockcp が黙って無効化されると「効かないつまみを回している」ことに
+		// 気づけないので、ここで一度だけ知らせる。アリーナは run_arena で
+		// 同じ条件の注記を出す(条件は think.cpp の oppNodeCountsFouls と揃えること)。
+		if (cfg_.blockCp > 0.0 && cfg_.oppModel > 0 && cfg_.foulGainScale > 0.0) {
+			if (cfg_.oppReplyKStage1 > 0)
+				sync_cout << "info string note: blockcp=" << cfg_.blockCp
+				          << " は oppmodel=" << cfg_.oppModel
+				          << " / foulgain=" << cfg_.foulGainScale
+				          << " / oppreplykstage1=" << cfg_.oppReplyKStage1
+				          << " のとき無効化されます(相手ノードが同じ妨害の価値を数えるため)"
+				          << sync_endl;
+			else
+				sync_cout << "info string note: blockcp=" << cfg_.blockCp
+				          << " は oppreplykstage1=0 なので有効なままですが、"
+				          << "stage2 の相手ノードも foulgain=" << cfg_.foulGainScale
+				          << " で同じ妨害の価値を数えるため二重計上になります" << sync_endl;
+		}
 	}
 
 	void cmd_moveok(std::istringstream& is) {
