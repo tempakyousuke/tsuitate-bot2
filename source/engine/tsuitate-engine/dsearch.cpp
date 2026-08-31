@@ -189,8 +189,14 @@ Value DSearch::opp_node(Position& pos, int depth, int ply) {
 			Piece cap = pos.piece_on(m.to_sq());
 			if (cap == NO_PIECE)
 				continue;
+			// 同じ捕獲に成/不成の2変種があるとき、`>` だけだと partial_sort 後の
+			// 未規定な順序で不成が残りうる。λ項が見たいのは「最も痛い応手」なので、
+			// 価値が同じなら成りを選ぶ。
 			int v = Eval::CapturePieceValue[type_of(cap)];
-			if (v > bestVal) { bestVal = v; bestCap = i; }
+			const bool better = v > bestVal
+			                 || (v == bestVal && m.is_promote() && bestCap != UINT32_MAX
+			                     && !intents[bestCap].m.is_promote());
+			if (better) { bestVal = v; bestCap = i; }
 		}
 		if (bestCap != UINT32_MAX && std::find(sel.begin(), sel.end(), bestCap) == sel.end())
 			sel.push_back(bestCap);
@@ -274,15 +280,30 @@ Value DSearch::opp_node(Position& pos, int depth, int ply) {
 	double v = (1.0 - lambda) * expVal + lambda * maxVal;
 
 	// 相手の期待反則。相手視点の値なので減点する。
-	// p_ok→0 で発散するが、p_ok は手書きpriorに依存する粗い量なので上限を掛ける
-	// (青天井にすると「相手は必ず反則する」と信じ込んだ楽観的な読み筋を選ぶ)。
-	const double eFoul = std::min(cfg->oppFoulCap, (1.0 - pOk) / std::max(pOk, 1e-6));
-	// foul_value は「持ち点の1/10」のスケールで、相手の反則累計が増えると
-	// 10/(10-f) で急騰する(f=9 で 8900cp)。これをそのまま局面評価に足すと
-	// **相手が反則を重ねるほど全相手ノードが下のクランプに張り付き、
-	// 位置評価が丸ごと消える**(反則経済が勝敗を決める終盤でそうなる)。
-	// 局面評価と同じ通貨で足す以上、局面評価のレンジに収まる量に抑える必要がある。
-	v -= std::min(foulGain * eFoul, cfg->oppFoulMaxCp);
+	//
+	// **この項は ply==1(こちらの候補手の直後の相手の手番)でしか足さない。**
+	// 設計上この項が表すのは「いま指す手が相手に何回反則させるか」であって、
+	// 読み筋の先の相手の手番ぶんまで足し上げるものではない。
+	// oppModel=2 では相手ノードが ply=1,3,5,… と並ぶので、各ノードで足すと
+	//   root = E[評価] + foul(ply1) + foul(ply3) + foul(ply5) + …
+	// となり、`oppFoulMaxCp` はノード単位の上限にしかならず**読み筋単位では
+	// 青天井**になる。実測でも oppmodel 2 / foulgain 4 / oppfoulmax 2500 だと
+	// 深さ2で cp=30、深さ4で cp=2139 と、相手ノードが1つ増えるだけで
+	// 2000cp 以上動いた。行き着く先は全候補が ±MIX_MAX に張り付いて、
+	// 手の選択が 0〜4cp の乱数タイブレークに退化する状態 ——
+	// `oppFoulMaxCp` がまさに防ぐつもりだった「位置評価が消える」失敗そのもの。
+	//
+	// そもそも反則予算は対局全体で10回しかない有限資源なので、
+	// 手番ごとに独立に足し上げる形が誤り。1手番ぶんだけ数える。
+	if (ply == 1) {
+		// p_ok→0 で発散するが、p_ok は手書きpriorに依存する粗い量なので上限を掛ける
+		// (青天井にすると「相手は必ず反則する」と信じ込んだ楽観的な読み筋を選ぶ)。
+		const double eFoul = std::min(cfg->oppFoulCap, (1.0 - pOk) / std::max(pOk, 1e-6));
+		// foul_value は「持ち点の1/10」のスケールで、相手の反則累計が増えると
+		// 10/(10-f) で急騰する(f=9 で 8900cp)。局面評価と同じ通貨で足す以上、
+		// 局面評価のレンジに収まる量に抑える必要がある。
+		v -= std::min(foulGain * eFoul, cfg->oppFoulMaxCp);
+	}
 
 	// 詰みスコアの範囲には入れない(この値は確率混合であって詰みの保証ではない)。
 	// 本物の詰みを返すのは上の mated_in(2か所)と exhaustive&&allWeMate /

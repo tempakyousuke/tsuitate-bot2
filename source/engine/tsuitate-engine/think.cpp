@@ -74,13 +74,24 @@ void block_map(const std::vector<ParticlePtr>& parts, Color us, size_t k,
 		double total = 0.0;  // 相手の「指したい手」の総数(正規化用)
 
 		for (const auto& it : intents) {
-			total += 1.0;
 			const Move m = it.m;
 			if (m.is_drop()) {
 				// 打ちたいマスにこちらの駒があれば、打ちマス占有で反則になる
+				total += 1.0;
 				votes[m.to_sq()] += 1.0;
 				continue;
 			}
+			// **成り変種は数えない。** enumerate_opp_intents は同じ from→to に
+			// 成りと不成の2つの意図を出すが、妨害の観点ではどちらも
+			// 「その経路を通ろうとする1つの試み」でしかなく、経路は完全に同じ。
+			// 両方数えると、成れる手だけが打ちに対して2倍の重みを持ち、
+			// マップの正規化が静かにずれる(= 過去に較正した blockcp の値が
+			// 別の意味になる)。強制成りの手は不成の変種が生成されないので、
+			// 「不成が存在しない成り」だけは数える必要がある。
+			if (m.is_promote()
+			    && piece_can_stay(opp, type_of(pos.piece_on(m.from_sq())), m.to_sq()))
+				continue;  // 同じ from→to の不成が別途あるので、そちらで数える
+			total += 1.0;
 			// 妨害できるのはスライダーの通過マスだけ(桂は飛ぶ、1マス駒は経路がない)。
 			// 着地マスにいるだけなら「取られる」= 合法手なので数えない。
 			Bitboard mid = between_bb(m.from_sq(), m.to_sq());
