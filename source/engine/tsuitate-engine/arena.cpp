@@ -59,6 +59,8 @@ struct ArenaStats {
 	// 平均が反則率で重み付いてしまう。設定間で比べる指標はすべて手番単位で取る。
 	long long turns = 0;
 	long long particleSum = 0, zeroParticle = 0;
+	// 探索スループット(§3.1/§3.2の採用ゲート用)。決定ごとに集計する。
+	long long nodesSum = 0, thinkMsSum = 0, depthSum = 0;
 	double    pLegalSum = 0;     // 整数%で持つと二重に切り捨てて0.5pp沈むのでdoubleで持つ
 	long long relaxHist[4] = {};  // 緩和レベル別の手番数(3=合成粒子)
 	double    kingAccSum = 0, occAccSum = 0;
@@ -72,6 +74,9 @@ struct ArenaStats {
 			decisionsAtZero++;
 		else if (r.relaxLevel > 0)
 			decisionsAtRelax++;
+		nodesSum   += (long long) r.nodes;
+		thinkMsSum += (long long) r.elapsedMs;
+		depthSum   += r.depthReached;
 	}
 	void add_turn(const ThinkResult& r) {
 		turns++;
@@ -475,6 +480,11 @@ void run_arena(const ArenaOptions& opt) {
 		          // zero_particle / relax(...) と突き合わせられない
 		          << " (after_zero=" << g.foulsAfterZero << "/" << g.decisionsAtZero
 		          << " after_relax=" << g.foulsAfterRelax << "/" << g.decisionsAtRelax << ")";
+		// 探索スループット(§3.1/§3.2 の採用ゲート)。knps の分母は思考時間全体
+		// (信念の同期込み)なので、探索だけの nodes/s より低めに出る点に注意。
+		std::cout << " avg_depth=" << (double(g.depthSum) / double(g.decisions))
+		          << " knps=" << (g.thinkMsSum > 0
+		                              ? double(g.nodesSum) / double(g.thinkMsSum) : 0.0);
 		if (g.truthSamples)
 			std::cout << " king_acc=" << (100.0 * g.kingAccSum / double(g.truthSamples)) << "%"
 			          << " occ_rec=" << (100.0 * g.occAccSum / double(g.truthSamples)) << "%";

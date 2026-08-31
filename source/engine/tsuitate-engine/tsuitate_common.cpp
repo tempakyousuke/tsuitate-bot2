@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <thread>
 
 #include "../../bitboard.h"
 
@@ -403,6 +404,24 @@ Move parse_usi_move(const OwnView& view, const std::string& s) {
 	bool promote = s.size() >= 5 && s[4] == '+';
 	return promote ? make_move_promote(from, to, view.us, type_of(pc))
 	               : make_move(from, to, view.us, type_of(pc));
+}
+
+// ---------------------------------------------------------------------------
+// 並列ヘルパ
+// ---------------------------------------------------------------------------
+
+void run_workers(int nThreads, const std::function<void(int)>& fn) {
+	if (nThreads <= 1) {
+		fn(0);
+		return;
+	}
+	std::vector<std::thread> ts;
+	ts.reserve(size_t(nThreads - 1));
+	for (int w = 1; w < nThreads; ++w)
+		ts.emplace_back([&fn, w] { fn(w); });
+	fn(0);
+	for (auto& t : ts)
+		t.join();
 }
 
 } // namespace Tsuitate

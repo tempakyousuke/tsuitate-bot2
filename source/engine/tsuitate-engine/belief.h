@@ -98,7 +98,9 @@ private:
 	// relax: 緩和レベル(0=全制約 / 1=自反則と「王手なし」を無視 / 2=さらに「王手あり」も無視)
 	// seed:  死んだ粒子の相手手列。先頭 (seed->size() - resample) 手をそのまま使い、
 	//        残りだけ整合サンプリングし直す(部分若返り)。nullptrなら全手サンプリング。
-	ParticlePtr replay_one(const GameHistory& hist, int relax,
+	// rng:   乱数源。並列再生成ではワーカーごとに独立の PRNG を渡す
+	//        (rng_ を複数スレッドで共有すると競合する)。逐次経路は rng_ を渡す。
+	ParticlePtr replay_one(const GameHistory& hist, int relax, PRNG& rng,
 	                       const std::vector<Move>* seed = nullptr,
 	                       size_t resample = 0,
 	                       size_t* failIdx = nullptr);
@@ -124,8 +126,9 @@ private:
 
 	// 方策で1手選ぶ。excludeに入っている手は除く。
 	// cfg_.oppPolicy で相手モデルを切り替える(0=千里眼評価softmax / 1=非千里眼prior)。
+	// rng は replay_one と同じ理由で引数(並列時はワーカーの PRNG)。
 	Move sample_policy(Particle& p, const std::vector<Move>& moves,
-	                   const std::vector<Move>& exclude);
+	                   const std::vector<Move>& exclude, PRNG& rng);
 
 	// この手番でこれまでに反則になった自分の手(履歴の末尾から導出)。
 	// 現局面に対する強い制約なので、合成粒子の棄却に使う。
@@ -137,7 +140,8 @@ private:
 	// 合成粒子: 履歴を使わず、既知の駒勘定(相手の持ち駒・盤上駒種は観測から
 	// 一意に決まる)と現在の王手状態だけを満たす配置を直接サンプリングする。
 	// リプレイが全滅したときの最終フォールバック。
-	ParticlePtr synthesize(const OwnView& view);
+	// rng は replay_one と同じ理由で引数(並列時はワーカーの PRNG)。
+	ParticlePtr synthesize(const OwnView& view, PRNG& rng);
 
 	Color                    us_ = BLACK;
 	Config                   cfg_;

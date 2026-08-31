@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 
 #include "../../movegen.h"
 #include "../../evaluate.h"
@@ -99,7 +100,7 @@ bool Belief::opp_move_consistent(const Particle& p, const HistEvent& ev, Move m,
 
 // 方策 = softmax(スコア / 温度) + ε一様。excludeの手は候補から外す。
 Move Belief::sample_policy(Particle& p, const std::vector<Move>& moves,
-                           const std::vector<Move>& exclude) {
+                           const std::vector<Move>& exclude, PRNG& rng) {
 	std::vector<Move>  cand;
 	for (Move m : moves)
 		if (std::find(exclude.begin(), exclude.end(), m) == exclude.end())
@@ -136,7 +137,7 @@ Move Belief::sample_policy(Particle& p, const std::vector<Move>& moves,
 	for (size_t i = 0; i < cand.size(); ++i)
 		w[i] = (1.0 - cfg_.policyEps) * (w[i] / sum) + cfg_.policyEps / double(cand.size());
 
-	double r = double(rng_.rand<uint64_t>() >> 11) / double(1ull << 53);
+	double r = double(rng.rand<uint64_t>() >> 11) / double(1ull << 53);
 	double acc = 0;
 	for (size_t i = 0; i < cand.size(); ++i) {
 		acc += w[i];
@@ -237,7 +238,7 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 
 		// 2) 各親の着手をサンプリング
 		for (auto& pd : pend)
-			pd.chosen = sample_policy(*pd.p, pd.moves, {});
+			pd.chosen = sample_policy(*pd.p, pd.moves, {}, rng_);
 
 		// 3) 人口が目標を下回るぶんは、別の整合手で親を複製して補う
 		std::vector<ParticlePtr> next;
@@ -250,7 +251,7 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 			Pending& pd = pend[idx % pend.size()];
 			if (!pd.p->synthetic && pd.moves.size() >= 2) {
 				std::vector<Move> excl = {pd.chosen};
-				Move alt = sample_policy(*pd.p, pd.moves, excl);
+				Move alt = sample_policy(*pd.p, pd.moves, excl, rng_);
 				if (alt != Move::none()) {
 					auto child = clone_of(hist, *pd.p);
 					child->oppMoves.push_back(alt);
@@ -325,7 +326,7 @@ double stale_factor(int st) {
 //   相手の盤上駒 = 相手の初期20枚 - 自分の持ち駒
 // を満たす配置を、上の事前分布と演繹(確実な空きマス・確実に相手駒がいるマス)に
 // 従ってサンプリングし、王手状態と「この手番で反則になった手」の整合を確認する。
-ParticlePtr Belief::synthesize(const OwnView& view) {
+ParticlePtr Belief::synthesize(const OwnView& view, PRNG& rng) {
 	const Color us  = view.us;
 	const Color opp = ~us;
 
@@ -389,8 +390,8 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 							path.push_back(t);
 					}
 				}
-				if (!path.empty() && (rng_.rand<uint64_t>() % 100) < 65)
-					sq = path[rng_.rand<uint64_t>() % path.size()];
+				if (!path.empty() && (rng.rand<uint64_t>() % 100) < 65)
+					sq = path[rng.rand<uint64_t>() % path.size()];
 			}
 			if (sq == SQ_NB || view.board[sq] != NO_PIECE || sq == forcedSq)
 				continue;
@@ -423,7 +424,7 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 			int capturedAvail = std::min(view.oppCaptured[pt], oppTotal[pt]);
 			int h = 0;
 			for (int c = 0; c < capturedAvail; ++c)
-				if ((rng_.rand<uint64_t>() % 100) < 70)  // 取られた駒は7割がまだ持ち駒と仮定
+				if ((rng.rand<uint64_t>() % 100) < 70)  // 取られた駒は7割がまだ持ち駒と仮定
 					++h;
 			oppHand[pt]  = h;
 			oppBoard[pt] = oppTotal[pt] - h;
@@ -471,7 +472,7 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 			}
 			if (total <= 0)
 				return false;
-			double r    = double(rng_.rand<uint64_t>() >> 11) / double(1ull << 53) * total;
+			double r    = double(rng.rand<uint64_t>() >> 11) / double(1ull << 53) * total;
 			size_t pick = SIZE_MAX;
 			double acc  = 0;
 			for (size_t k = 0; k < n; ++k) {
@@ -490,7 +491,7 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 			bool promoted = false;
 			if (raw != KING && raw != GOLD) {
 				int pr = in_our_camp(sq) ? 25 : 2;
-				promoted = (rng_.rand<uint64_t>() % 100) < uint64_t(pr);
+				promoted = (rng.rand<uint64_t>() % 100) < uint64_t(pr);
 				// 不成では存在できないマス(行き所のない駒)は強制成り
 				if (!promoted && !piece_can_stay(opp, raw, sq))
 					promoted = raw == PAWN || raw == LANCE || raw == KNIGHT;
@@ -515,7 +516,7 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 					avail.push_back(PieceType(pt));
 			if (avail.empty())
 				continue;
-			checkerRaw = avail[rng_.rand<uint64_t>() % avail.size()];
+			checkerRaw = avail[rng.rand<uint64_t>() % avail.size()];
 		}
 
 		// 演繹による強制配置(相手が最後に取ったマス)。
@@ -527,7 +528,7 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 				if (oppBoard[pt] > 0)
 					avail.push_back(PieceType(pt));
 			if (!avail.empty())
-				forcedRaw = avail[rng_.rand<uint64_t>() % avail.size()];
+				forcedRaw = avail[rng.rand<uint64_t>() % avail.size()];
 		}
 
 		// 演繹で決まっているマスを先に埋める。玉を先に置くと、玉がたまたま
@@ -547,7 +548,7 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 					avail.push_back(PieceType(pt));
 			if (avail.empty())
 				break;
-			PieceType raw = avail[rng_.rand<uint64_t>() % avail.size()];
+			PieceType raw = avail[rng.rand<uint64_t>() % avail.size()];
 			if (!place(raw, fs)) {
 				ok = false;
 				break;
@@ -581,7 +582,7 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 			// (取ったその駒が王手をかけている)。まずそのマスへの配置を試す。
 			Square hint = view.lastOppCaptureSq;
 			if (hint != SQ_NB && board[hint] == NO_PIECE
-			    && (rng_.rand<uint64_t>() % 100) < 85) {
+			    && (rng.rand<uint64_t>() % 100) < 85) {
 				for (int promo = 1; promo >= 0 && !placed; --promo) {  // 成り優先(と金攻めが典型)
 					if (checkerRaw == GOLD && promo)
 						continue;
@@ -688,29 +689,55 @@ ParticlePtr Belief::synthesize(const OwnView& view) {
 
 void Belief::force_resynthesize(const OwnView& view, TimePoint deadline) {
 	parts_.clear();
-	int misses = 0;
 	// particles を小さくしたときに設定値を超えて作らないよう頭打ちにする
 	size_t target = std::min(size_t(cfg_.particles),
 	                         std::max<size_t>(16, size_t(cfg_.particles) / 4));
 	// synthesize は1回あたり最大30試行回るので、回数だけでなく時計でも止める
 	// (sync が予算を使ったあとに呼ばれるため、ここで時間切れを起こしうる)。
-	while (parts_.size() < target && misses < 400) {
-		// 締め切りを過ぎていても、1粒子も作れていないうちは少しだけ粘る
-		// (空の信念で戻ると呼び出し側が手を選べなくなる)。ただし無制限にはしない
-		// ―― 粘る回数を絞らないと 400ミス×30試行ぶん予算を食い潰しうる。
-		if (now() >= deadline && (!parts_.empty() || misses >= 40))
-			break;
-		auto p = synthesize(view);
-		if (p)
-			parts_.push_back(std::move(p));
-		else
-			++misses;
+	if (cfg_.threads > 1) {
+		// 並列版: 続行判定(共有カウンタ)だけロックの中で行い、synthesize 本体は
+		// ワーカーごとの PRNG でロックなしに走らせる。判定の規則は逐次版と同じ。
+		std::mutex mu;
+		int misses = 0;
+		const uint64_t base = rng_.rand<uint64_t>();
+		run_workers(cfg_.threads, [&](int w) {
+			PRNG rng((base ^ (uint64_t(w) * 0x9e3779b97f4a7c15ull)) | 1);
+			while (true) {
+				{
+					std::lock_guard<std::mutex> lk(mu);
+					if (parts_.size() >= target || misses >= 400)
+						return;
+					if (now() >= deadline && (!parts_.empty() || misses >= 40))
+						return;
+				}
+				auto p = synthesize(view, rng);
+				std::lock_guard<std::mutex> lk(mu);
+				if (p)
+					parts_.push_back(std::move(p));
+				else
+					++misses;
+			}
+		});
+	} else {
+		int misses = 0;
+		while (parts_.size() < target && misses < 400) {
+			// 締め切りを過ぎていても、1粒子も作れていないうちは少しだけ粘る
+			// (空の信念で戻ると呼び出し側が手を選べなくなる)。ただし無制限にはしない
+			// ―― 粘る回数を絞らないと 400ミス×30試行ぶん予算を食い潰しうる。
+			if (now() >= deadline && (!parts_.empty() || misses >= 40))
+				break;
+			auto p = synthesize(view, rng_);
+			if (p)
+				parts_.push_back(std::move(p));
+			else
+				++misses;
+		}
 	}
 	relaxMean_  = relax_mean();
 	relaxLevel_ = int(relaxMean_ + 0.5);
 }
 
-ParticlePtr Belief::replay_one(const GameHistory& hist, int relax,
+ParticlePtr Belief::replay_one(const GameHistory& hist, int relax, PRNG& rng,
                                const std::vector<Move>* seed, size_t resample,
                                size_t* failIdx) {
 	auto p = std::make_unique<Particle>();
@@ -771,8 +798,8 @@ ParticlePtr Belief::replay_one(const GameHistory& hist, int relax,
 					// 回数の多いリプレイでもフィルタと同じ方策が使える。
 					// (従来は一様サンプリングで、フィルタとリプレイで相手モデルが
 					//  食い違っていた ＝ 再生成した粒子だけ相手の指し手がでたらめ)
-					m = cfg_.oppPolicy != 0 ? sample_policy(*p, buf, {})
-					                        : buf[rng_.rand<uint64_t>() % buf.size()];
+					m = cfg_.oppPolicy != 0 ? sample_policy(*p, buf, {}, rng)
+					                        : buf[rng.rand<uint64_t>() % buf.size()];
 				}
 			}
 			if (m == Move::none())
@@ -845,6 +872,83 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 	TimePoint ladderEnd = t0 + total * 4 / 5;
 	TimePoint gate[3] = { t0 + total * 2 / 5, t0 + total * 3 / 5, ladderEnd };
 
+	if (cfg_.threads > 1) {
+		// --- 並列再生成(§3.1) ---
+		// ワーカーごとに (基準乱数, workerId) から導出した独立の PRNG でリプレイし、
+		// 完成粒子は mutex で回収する。墓場(graveyard_)は再生成中に書かれない
+		// (bury は apply_event の中でしか呼ばれない)ので、ロックなしで読んでよい。
+		// ラダーのエスカレーション(relaxレベル・失敗数・時間門)は共有状態として
+		// ロックの中で判定する = 規則は逐次版と同一。
+		//
+		// 逐次版と乱数の消費列は揃えない(粒子の中身は並びも含めて変わる)。
+		// threads は挙動が変わり得るフラグとして扱い、A/B は threads 同士で行うこと。
+		std::mutex mu;
+		int relax = 0;
+		int fails = 0;
+		int tries = 0;
+		const uint64_t base = rng_.rand<uint64_t>();
+		run_workers(cfg_.threads, [&](int w) {
+			PRNG rng((base ^ (uint64_t(w) * 0x9e3779b97f4a7c15ull)) | 1);
+			while (true) {
+				int    myRelax;
+				size_t myFails;
+				int    myTry;
+				{
+					std::lock_guard<std::mutex> lk(mu);
+					for (;;) {
+						size_t target = relax == 0 ? want : hardMin;
+						if (parts_.size() >= target || tries >= cfg_.regenTries)
+							return;
+						bool exhausted = now() >= gate[relax] || fails >= 400;
+						if (exhausted) {
+							// 厳密粒子が最低限あるなら緩和はしない(緩和粒子は推定を汚す)
+							if (parts_.size() >= hardMin || relax >= 2)
+								return;
+							++relax;
+							fails = 0;
+							continue;
+						}
+						break;
+					}
+					myTry   = ++tries;
+					myRelax = relax;
+					myFails = size_t(fails);
+				}
+				// 種の質 = 長さ(どこまで観測と整合して生きたか)。長い種を優先する。
+				size_t maxLen = 0;
+				for (const auto& s : graveyard_)
+					maxLen = std::max(maxLen, s.size());
+				const std::vector<Move>* seed = nullptr;
+				if (!graveyard_.empty() && (myTry % 13) != 0) {
+					// 最長クラスの種が引けるまで数回引き直す
+					for (int k = 0; k < 8; ++k) {
+						const auto& s = graveyard_[rng.rand<uint64_t>() % graveyard_.size()];
+						if (s.size() + 2 >= maxLen) { seed = &s; break; }
+					}
+				}
+				ParticlePtr p;
+				size_t      failIdx = 0;
+				if (seed) {
+					static const size_t RS[4] = {2, 4, 8, 16};
+					size_t r = RS[std::min<size_t>(3, myFails / 25)];
+					p = replay_one(hist, myRelax, rng, seed, r, &failIdx);
+				} else {
+					p = replay_one(hist, myRelax, rng, nullptr, 0, &failIdx);
+				}
+				{
+					std::lock_guard<std::mutex> lk(mu);
+					if (p) {
+						parts_.push_back(std::move(p));
+						fails = 0;
+					} else {
+						++fails;
+						failHist_[std::min<size_t>(failIdx < cursor_ ? cursor_ - 1 - failIdx : 0, 15)]++;
+						failKind_[size_t(hist.events[failIdx].kind)]++;
+					}
+				}
+			}
+		});
+	} else {
 	int relax = 0;
 	int fails = 0;
 	int tries = 0;
@@ -879,9 +983,9 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 		if (seed) {
 			static const size_t RS[4] = {2, 4, 8, 16};
 			size_t r = RS[std::min<size_t>(3, fails / 25)];  // 失敗が続くほど幅を広げる(戻さない)
-			p = replay_one(hist, relax, seed, r, &failIdx);
+			p = replay_one(hist, relax, rng_, seed, r, &failIdx);
 		} else {
-			p = replay_one(hist, relax, nullptr, 0, &failIdx);
+			p = replay_one(hist, relax, rng_, nullptr, 0, &failIdx);
 		}
 		if (p) {
 			parts_.push_back(std::move(p));
@@ -892,6 +996,7 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 			failKind_[size_t(hist.events[failIdx].kind)]++;
 		}
 	}
+	}
 	relaxMean_  = relax_mean();
 	relaxLevel_ = int(relaxMean_ + 0.5);
 
@@ -900,13 +1005,36 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 	// 「駒勘定と王手状態だけ合う配置」でも 0粒子(当てずっぽう)よりはるかにまし。
 	if (parts_.size() < hardMin) {
 		size_t synthTarget = std::max(hardMin, want / 4);
-		int    misses      = 0;
-		while (parts_.size() < synthTarget && misses < 200 && now() < deadline + 100) {
-			auto p = synthesize(view);
-			if (p)
-				parts_.push_back(std::move(p));
-			else
-				++misses;
+		if (cfg_.threads > 1) {
+			std::mutex mu;
+			int misses = 0;
+			const uint64_t base = rng_.rand<uint64_t>();
+			run_workers(cfg_.threads, [&](int w) {
+				PRNG rng((base ^ (uint64_t(w) * 0x9e3779b97f4a7c15ull)) | 1);
+				while (true) {
+					{
+						std::lock_guard<std::mutex> lk(mu);
+						if (!(parts_.size() < synthTarget && misses < 200
+						      && now() < deadline + 100))
+							return;
+					}
+					auto p = synthesize(view, rng);
+					std::lock_guard<std::mutex> lk(mu);
+					if (p)
+						parts_.push_back(std::move(p));
+					else
+						++misses;
+				}
+			});
+		} else {
+			int misses = 0;
+			while (parts_.size() < synthTarget && misses < 200 && now() < deadline + 100) {
+				auto p = synthesize(view, rng_);
+				if (p)
+					parts_.push_back(std::move(p));
+				else
+					++misses;
+			}
 		}
 		relaxMean_  = relax_mean();
 		relaxLevel_ = int(relaxMean_ + 0.5);

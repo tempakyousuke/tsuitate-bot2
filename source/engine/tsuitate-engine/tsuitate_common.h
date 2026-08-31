@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -284,6 +285,11 @@ struct Config {
 	// 粒子数が目標のこの割合(%)以上あれば再生成をまるごと省く。
 	// 低いと時間は浮くが人口が痩せたまま(=p_legalの分解能と信念の多様性が落ちる)。
 	int  regenFloorPct  = 50;
+	// 思考のワーカースレッド数(§3.1 粒子並列)。1で従来どおりの逐次実行
+	// (コード経路も完全に同一。並列版はフラグの後ろに置く、の原則)。
+	// 粒子はほぼ独立なので、stage1/stage2(確定化探索)と信念の再生成・合成を
+	// 粒子単位で分割する。同じ予算でも粒子数と深さが実質スレッド数倍になる。
+	int  threads        = 1;
 	uint64_t seed       = 20260827;
 	int  logLevel       = 1;     // 0:silent 1:info 2:debug
 };
@@ -336,6 +342,19 @@ int fast_policy_score(const Position& pos, Color opp, Move m, bool inCheck,
 //   - 相手の反則の利得 = +foul_value(oppFouls) × foulGainScale(dsearch.cpp)
 // 自分側と相手側で同じ式を使う(値付けを散らすと別々に較正することになる)。
 double foul_value(double baseCp, double stepCp, int fouls);
+
+// ---------------------------------------------------------------------------
+// 並列ヘルパ
+// ---------------------------------------------------------------------------
+// fn(workerId) を nThreads 本(呼び出しスレッド含む)で走らせて合流する。
+// nThreads <= 1 なら fn(0) をその場で呼ぶだけ(スレッドは作らない)。
+//
+// 粒子並列の原則(docs/strengthening.md §3.1):
+//   - 同じ Position(粒子)に複数スレッドが do_move しない(粒子単位で分割する)
+//   - 結果の合算は必ず固定順で行う(浮動小数の和がスレッドスケジュールに
+//     依存しないように、ジョブごとの値を保存してから逐次還元する)
+//   - 乱数が要るワーカーには (基準seed, workerId) から導出した独立の PRNG を渡す
+void run_workers(int nThreads, const std::function<void(int)>& fn);
 
 // サイトのPieceRole文字列 <-> PieceType
 PieceType role_from_site(const std::string& s);

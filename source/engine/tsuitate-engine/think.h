@@ -27,6 +27,7 @@ struct ThinkResult {
 	int         relaxLevel = 0;   // 診断表示用(0..3)
 	double      relaxMean = 0;    // 反則コスト割増に使う連続値
 	int         depthReached = 0;
+	uint64_t    nodes = 0;        // 確定化探索の総ノード数(診断。nodes/sの分子)
 	TimePoint   elapsedMs = 0;
 };
 
