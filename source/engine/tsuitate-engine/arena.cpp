@@ -280,7 +280,14 @@ GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool v
 			mover->observe_turn(pos);
 		if (m == Move::none()) {
 			stat.winner = 1 - side;
-			stat.reason = "resign";
+			// 投了の理由を区別する。think() は「この手番で反則になった手を除いた
+			// 候補」が空になると Move::none() を返すので、**反則で候補を使い切った**
+			// 投了は反則負けと同じ性質の決着であって盤上の決着ではない。
+			// 残り反則予算より候補が少ない終盤では、反則累計が10に達する前に
+			// こちらが先に起こりうる。
+			// これを盤上決着に数えると、この施策の主要指標である board_rate が
+			// 「反則の消耗戦」を混ぜて水増しされてしまう。
+			stat.reason = retryOfSameTurn ? "resign_after_fouls" : "resign";
 			break;
 		}
 
@@ -356,10 +363,34 @@ void run_arena(const ArenaOptions& opt) {
 			          << " は粒子数 " << want << " では下限 " << hardMin
 			          << " 個(=" << (100 * hardMin / (want ? want : 1))
 			          << "%)に床上げされます" << std::endl;
+		// blockcp が黙って無効化される/二重に効くと「効かないつまみをスイープして
+		// いる」ことに気づけない(A/Bが丸ごと無意味になる)。
+		// 条件は think.cpp の oppNodeCountsFouls と厳密に揃えること。
+		if (c.blockCp > 0.0 && c.oppModel > 0 && c.foulGainScale > 0.0) {
+			if (c.oppReplyKStage1 > 0)
+				std::cout << "info string note: p" << (k + 1) << " blockcp=" << c.blockCp
+				          << " は oppmodel=" << c.oppModel << " / foulgain=" << c.foulGainScale
+				          << " / oppreplykstage1=" << c.oppReplyKStage1
+				          << " のとき無効化されます(相手ノードが同じ妨害の価値を数えるため)"
+				          << std::endl;
+			else
+				std::cout << "info string note: p" << (k + 1) << " blockcp=" << c.blockCp
+				          << " は oppreplykstage1=0 なので有効なままですが、"
+				          << "stage2 の相手ノードも foulgain=" << c.foulGainScale
+				          << " で同じ妨害の価値を数えるため二重計上になります"
+				          << std::endl;
+		}
 	}
 
 	int p1Wins = 0, p2Wins = 0, draws = 0;
 	long long p1Fouls = 0, p2Fouls = 0, plies = 0;
+	// 決着理由の内訳。信念を良くしても反則の消耗戦で勝っているだけ、という状態を
+	// 総合勝率は隠してしまう(第2版は勝ち星38のうち32が反則負け由来で、
+	// 盤上で決着した12局は6勝6敗の互角だった)。
+	// 「盤上で勝てるようになったか」は総合勝率とは別に数える。
+	int boardGames = 0, boardP1 = 0, boardP2 = 0;  // 詰み/ステイルメイト/投了
+	int foulGames  = 0, foulP1  = 0, foulP2  = 0;  // 反則負け
+	int otherGames = 0;                            // 手数切れ
 	TimePoint t0 = now();
 
 	for (int g = 0; g < opt.games; ++g) {
@@ -371,17 +402,35 @@ void run_arena(const ArenaOptions& opt) {
 		GameStat st  = p1Sente ? play_one(*a, *b, opt, opt.verbose)
 		                       : play_one(*b, *a, opt, opt.verbose);
 		int p1Side = p1Sente ? 0 : 1;
+		const bool p1Won = st.winner == p1Side;
 		if (st.winner == -1)
 			draws++;
-		else if (st.winner == p1Side)
+		else if (p1Won)
 			p1Wins++;
 		else
 			p2Wins++;
+
+		// 決着理由の内訳。反則負け以外で終わった局が「盤上で決着した局」。
+		if (st.winner == -1) {
+			otherGames++;
+		} else if (st.reason == "foul_limit" || st.reason == "resign_after_fouls") {
+			// resign_after_fouls = 反則で候補を使い切った投了。反則の消耗戦の結果なので
+			// 盤上決着に数えない(board_rate が水増しされる)
+			foulGames++;
+			(p1Won ? foulP1 : foulP2)++;
+		} else {
+			boardGames++;
+			(p1Won ? boardP1 : boardP2)++;
+		}
 		p1Fouls += st.fouls[p1Side];
 		p2Fouls += st.fouls[1 - p1Side];
 		plies += st.plies;
+		// A/B(p1cfg/p2cfg で片側だけ設定を変える)では両者とも種別名が "belief" に
+		// なるので、種別名だけでは勝者が読めない。p1/p2 を必ず添える。
 		std::cout << "info arena game " << (g + 1) << "/" << opt.games
-		          << " winner=" << (st.winner == -1 ? "draw" : st.winner == p1Side ? opt.p1 : opt.p2)
+		          << " winner=" << (st.winner == -1 ? std::string("draw")
+		                            : p1Won ? "p1(" + opt.p1 + ")" : "p2(" + opt.p2 + ")")
+		          << " sente=" << (p1Sente ? "p1" : "p2")
 		          << " reason=" << st.reason << " plies=" << st.plies
 		          << " fouls=" << st.fouls[p1Side] << "/" << st.fouls[1 - p1Side]
 		          << std::endl;
@@ -394,6 +443,18 @@ void run_arena(const ArenaOptions& opt) {
 	          << ", fouls/game p1=" << (p1Fouls / n) << " p2=" << (p2Fouls / n)
 	          << ", avg plies=" << (plies / n)
 	          << ", elapsed=" << (now() - t0) / 1000 << "s" << std::endl;
+	// 盤上決着の勝敗は「勝ちにいく力」の直接の指標。総合勝率と分けて見ること。
+	//
+	// この内訳は p1cfg/p2cfg のA/Bのために存在するので、種別名(両方とも "belief")
+	// だけでは勝った側が読めない。上の winner= と同じく p1/p2 を必ず添える。
+	const std::string n1 = "p1(" + opt.p1 + ")";
+	const std::string n2 = "p2(" + opt.p2 + ")";
+	std::cout << "  decided: board=" << boardGames
+	          << " (" << n1 << " " << boardP1 << " - " << boardP2 << " " << n2 << ")"
+	          << " foul=" << foulGames
+	          << " (" << n1 << " " << foulP1 << " - " << foulP2 << " " << n2 << ")"
+	          << " other=" << otherGames
+	          << " board_rate=" << (100.0 * boardGames / n) << "%" << std::endl;
 	for (int k = 0; k < 2; ++k) {
 		const ArenaStats& g = g_stats[k];
 		if (g.decisions == 0)

@@ -48,7 +48,7 @@ double fallback_score(const OwnView& view, Move m, PRNG& rng) {
 // 数え上げ、そのうち妨害になるマスに1票ずつ入れて、指したい手の総数で割る。
 // 出力は「相手の次の1手がそのマスで反則になる確率」の粒子平均。
 void block_map(const std::vector<ParticlePtr>& parts, Color us, size_t k,
-               double out[SQ_NB]) {
+               const Config& cfg, double out[SQ_NB]) {
 	for (auto sq : SQ)
 		out[sq] = 0.0;
 	k = std::min(k, parts.size());
@@ -56,59 +56,47 @@ void block_map(const std::vector<ParticlePtr>& parts, Color us, size_t k,
 		return;  // 粒子なし、または blockSamples=0(0除算でマップ全体がNaNになる)
 	const Color opp = ~us;
 	double votes[SQ_NB];
+	std::vector<OppIntent> intents;
 	for (size_t t = 0; t < k; ++t) {
 		const Position& pos = parts[t * parts.size() / k]->pos;
-		// 相手が見えている盤 = 相手自身の駒だけ(こちらの駒は見えない)
-		const Bitboard oppOcc = pos.pieces(opp);
+		// 相手の「指したい手」は探索の相手ノード(dsearch)・信念の方策と
+		// **同じ生成器**から取る。ここに独自の列挙を書くと、成り変種や
+		// 行き所のない駒の扱いが食い違って別の相手モデルになる
+		// (実際、以前はこの関数だけ成り変種と piece_can_stay を落としていた)。
+		// inCheck は「**相手が**王手されているか」。粒子は常にこちらの手番なので、
+		// 相手が王手されていることは定義上ありえない(ありえたら相手の玉を
+		// 取れる不正な局面)。pos.in_check() はこちら側の王手状態を返すので、
+		// ここに渡すのは誤り。妨害マップが見ているのは「次の相手の手番に
+		// 何を指したいか」であり、そのときの王手状態は予測できないので false。
+		enumerate_opp_intents(pos, opp, intents, /*inCheck=*/false, cfg);
 		for (auto sq : SQ)
 			votes[sq] = 0.0;
 		double total = 0.0;  // 相手の「指したい手」の総数(正規化用)
 
-		// 移動手の総数(妨害できるのはスライダーの通過マスだけだが、
-		// 分母には桂・1マス駒の手も入れる)
-		Bitboard movers = oppOcc;
-		while (movers) {
-			Square from = movers.pop();
-			Piece  pc   = pos.piece_on(from);
-			// 自分の駒にぶつかるまでを「指したい手」とみなす(こちらの駒は見えない)
-			Bitboard targets = effects_from(pc, from, oppOcc) & ~oppOcc;
-			const bool slider = [&] {
-				PieceType pt = type_of(pc);
-				return pt == LANCE || pt == BISHOP || pt == ROOK || pt == HORSE || pt == DRAGON;
-			}();
-			while (targets) {
-				Square to = targets.pop();
+		for (const auto& it : intents) {
+			const Move m = it.m;
+			if (m.is_drop()) {
+				// 打ちたいマスにこちらの駒があれば、打ちマス占有で反則になる
 				total += 1.0;
-				if (!slider)
-					continue;  // 桂は飛ぶ、1マス駒は経路がない
-				Bitboard mid = between_bb(from, to);
-				while (mid)
-					votes[mid.pop()] += 1.0;
-			}
-		}
-
-		// 打ち。相手の持ち駒は粒子ごとの仮説。自分の駒のないマス全部が打ちたい候補で、
-		// そこにこちらの駒があれば打ちマス占有で反則になる。
-		Hand h = pos.hand_of(opp);
-		for (PieceType pt : {PAWN, LANCE, KNIGHT, SILVER, GOLD, BISHOP, ROOK}) {
-			if (!hand_exists(h, pt))
+				votes[m.to_sq()] += 1.0;
 				continue;
-			Bitboard banFiles = Bitboard(ZERO);
-			if (pt == PAWN) {
-				Bitboard pawns = pos.pieces(PAWN) & oppOcc;
-				while (pawns)
-					banFiles = banFiles | file_bb(file_of(pawns.pop()));
 			}
-			for (auto to : SQ) {
-				if (oppOcc & to)
-					continue;
-				if (!piece_can_stay(opp, pt, to))
-					continue;
-				if (pt == PAWN && (banFiles & to))
-					continue;
-				votes[to] += 1.0;
-				total     += 1.0;
-			}
+			// **成り変種は数えない。** enumerate_opp_intents は同じ from→to に
+			// 成りと不成の2つの意図を出すが、妨害の観点ではどちらも
+			// 「その経路を通ろうとする1つの試み」でしかなく、経路は完全に同じ。
+			// 両方数えると、成れる手だけが打ちに対して2倍の重みを持ち、
+			// マップの正規化が静かにずれる(= 過去に較正した blockcp の値が
+			// 別の意味になる)。強制成りの手は不成の変種が生成されないので、
+			// 「不成が存在しない成り」だけは数える必要がある。
+			if (m.is_promote()
+			    && piece_can_stay(opp, type_of(pos.piece_on(m.from_sq())), m.to_sq()))
+				continue;  // 同じ from→to の不成が別途あるので、そちらで数える
+			total += 1.0;
+			// 妨害できるのはスライダーの通過マスだけ(桂は飛ぶ、1マス駒は経路がない)。
+			// 着地マスにいるだけなら「取られる」= 合法手なので数えない。
+			Bitboard mid = between_bb(m.from_sq(), m.to_sq());
+			while (mid)
+				votes[mid.pop()] += 1.0;
 		}
 
 		if (total <= 0.0)
@@ -232,8 +220,8 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	};
 
 	// 反則コスト(centipawn)。累計10回で反則負けなので、残り予算が減るほど急騰させる。
-	double remain = std::max(1.0, 10.0 - view.ourFouls);
-	double foulCp = -(cfg.foulBaseCp + cfg.foulStepCp * view.ourFouls) * (10.0 / remain);
+	// 値付けは foul_value に一本化してある(相手の反則の利得も同じ式の鏡像を使う)。
+	double foulCp = -foul_value(cfg.foulBaseCp, cfg.foulStepCp, view.ourFouls);
 	// 相手が反則負けに近い = こちらが勝勢。勝ちを守るためリスクをさらに嫌う。
 	foulCp *= 1.0 + cfg.foulOppW * view.oppFouls;
 	// 信念の品質が悪い(緩和粒子・粒子不足)ときはp_legalの推定が信用できないので、
@@ -244,12 +232,33 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	if (NP * 4 < size_t(cfg.particles))
 		foulCp *= 2.0;
 
+	// 相手の反則1回のこちらから見た価値。探索の相手ノード(oppModel)が
+	// 「相手がこの局面で何回反則しそうか」に掛けて使う。自分の反則コストと
+	// 同じ foul_value を使うので、値付けが2か所に分かれない。
+	const double foulGain =
+	    cfg.foulGainScale * foul_value(cfg.foulBaseCp, cfg.foulStepCp, view.oppFouls);
+
 	// 妨害マップ(相手の反則を誘う配置への加点)。合法だったときにだけ効くので
 	// p_legal を掛ける。移動元を空けるぶんは差し引く。
+	//
+	// この加点を落としてよいのは、探索の相手ノードが同じ価値を
+	// **候補手の序列を決める段(stage1)でも**数えているときだけ。3条件が要る:
+	//   oppModel > 0        … 相手ノードを modeling している
+	//   foulGainScale > 0   … その相手ノードが反則の価値を実際に数えている
+	//   oppReplyKStage1 > 0 … stage1 でも相手ノードを展開している
+	// 3つ目が要るのは、上位 stage2TopK 手を切るのが stage1 だから。
+	// stage1 が千里眼qsearchのままだと、妨害の価値はstage1のどこにも入らず、
+	// 妨害が狙いの候補手は stage2 に到達する前に切り落とされる
+	// (= blockcp のA/Bが丸ごと無意味になる)。
+	//
+	// なお oppModel == 1 では ply==1 の相手ノードしか modeling しないので、
+	// それ以降の相手の手番に対する妨害の価値はどちらの経路でも数えていない。
+	const bool oppNodeCountsFouls =
+	    cfg.oppModel > 0 && cfg.foulGainScale > 0.0 && cfg.oppReplyKStage1 > 0;
 	std::vector<double> blockBonus(M, 0.0);
-	if (cfg.blockCp > 0.0 && NP > 0) {
+	if (cfg.blockCp > 0.0 && !oppNodeCountsFouls && NP > 0) {
 		double map[SQ_NB];
-		block_map(parts, view.us, size_t(cfg.blockSamples), map);
+		block_map(parts, view.us, size_t(cfg.blockSamples), cfg, map);
 		for (size_t i = 0; i < M; ++i) {
 			Move m = cands[i];
 			double d = map[m.to_sq()];
@@ -292,10 +301,25 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 			StateInfo st;
 			DSearch ds;
 			ds.nodesLimit = 20000;
+			ds.cfg = &cfg;
+			ds.us = view.us;
+			ds.foulGain = foulGain;
+			ds.oppK1 = cfg.oppReplyKStage1;
 			pos.do_move(cands[i], st);
-			Value v = -ds.qsearch(pos, -VALUE_INFINITE, VALUE_INFINITE, 1);
+			// stage1 は本来この一手ぶんの静止探索だけで粗く序列化する段。
+			// ただし千里眼のqsearchは「進めた駒は必ず取られる」と読むので、
+			// 相手モデルを入れたい前進手が上位12手に残らずstage2に届かない。
+			// oppReplyKStage1 > 0 なら深さ1の探索(= 相手ノード1つ + その子のqsearch)に
+			// 差し替えて、序列化にも同じ相手モデルを効かせる。
+			Value v;
+			if (cfg.oppModel > 0 && cfg.oppReplyKStage1 > 0)
+				v = -ds.search(pos, 1, -VALUE_INFINITE, VALUE_INFINITE, 1);
+			else
+				v = -ds.qsearch(pos, -VALUE_INFINITE, VALUE_INFINITE, 1);
 			pos.undo_move(cands[i]);
-			sum += squash_cp(v);
+			// 相手ノードが確率混合を返したときは、その値は既に squash 済みの空間に
+			// いるので二重に squash しない(詰みが通常評価の上限に潰れる)。
+			sum += ds.rootMixed ? double(v) : squash_cp(v);
 		}
 		mean1[i] = sel.empty() ? 0.0 : sum / double(sel.size());
 		comb1[i] = combined(i, mean1[i]);
@@ -329,10 +353,14 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 				StateInfo st;
 				DSearch ds;
 				ds.nodesLimit = 60000;
+				ds.cfg        = &cfg;
+				ds.us         = view.us;
+				ds.foulGain   = foulGain;
 				pos.do_move(cands[i], st);
 				Value v = -ds.search(pos, d - 1, -VALUE_INFINITE, VALUE_INFINITE, 1);
 				pos.undo_move(cands[i]);
-				sum += squash_cp(v);
+				// 上と同じ理由で、混合値は二重に squash しない
+				sum += ds.rootMixed ? double(v) : squash_cp(v);
 				++cnt;
 			}
 			pass[i] = cnt > 0 ? combined(i, sum / double(cnt)) : comb1[i];
