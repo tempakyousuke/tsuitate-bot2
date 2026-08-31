@@ -29,6 +29,32 @@ int order_score(const Position& pos, Move m) {
 	return s;
 }
 
+// 確率混合の中で使う飽和。
+//
+// `squash_cp` は think() の集計用で、通常評価を ±2500 に、詰みを ±3000 に潰す。
+// これを **相手ノードの子に掛けてはいけない**: oppModel=2 では子の部分木の中に
+// さらに深い相手ノードがあり、その返り値は既に混合空間(最大 ±MIX_MAX)にいる。
+// そこへ `squash_cp` を掛けると (2500, 3000] が 2500 に丸められ、
+// 深いところの詰み寄りの評価が「ふつうの優勢」に潰れる。
+//
+// 空間の取り決め:
+//   本物の詰み      → ±MATE_MIX (±3000)   … この値だけが詰みを意味する
+//   それ以外        → ±MIX_MAX  (±2900)   … 通常評価も混合値もこの帯に収める
+// MIX_MAX と MATE_MIX の間に 100cp の余白を空けているのは、think() の最終選択が
+// 0〜4cp の乱数タイブレークを足すため。余白がないと
+// 「確率的にほぼ詰み」が「証明された詰み」と同点になり、乱数で詰みを蹴りうる。
+constexpr double MIX_MAX  = 2900.0;
+constexpr double MATE_MIX = 3000.0;
+
+double squash_for_mix(Value v) {
+	if (v >= VALUE_MATE_IN_MAX_PLY)
+		return MATE_MIX;
+	if (v <= VALUE_MATED_IN_MAX_PLY)
+		return -MATE_MIX;
+	// 既に混合空間にいる値(|v| <= MIX_MAX)はそのまま通る = べき等
+	return std::clamp(double(v), -MIX_MAX, MIX_MAX);
+}
+
 } // namespace
 
 Value DSearch::qsearch(Position& pos, Value alpha, Value beta, int ply) {
@@ -205,7 +231,12 @@ Value DSearch::opp_node(Position& pos, int depth, int ply) {
 		// 「相手が3割の確率で詰みを見逃す」は大きな正の値であって詰みではない。
 		// 期待値に混ぜる前に飽和させておかないと、詰みスコアが確率で薄まった値が
 		// 詰みスコアの範囲に残って上位ノードの解釈を壊す。
-		double s = squash_cp(v);
+		//
+		// ここで `squash_cp` を使うと、子の部分木にある**より深い相手ノード**が
+		// 返した混合値(既に混合空間にいる)の (2500, 2900] が 2500 に丸められ、
+		// 深いところの詰み寄りの評価が消える(oppmodel 2 で顕在化)。
+		// べき等な `squash_for_mix` を使うこと。
+		double s = squash_for_mix(v);
 		expVal += (w[i] / wSel) * s;
 		maxVal = std::max(maxVal, s);
 	}
@@ -260,16 +291,22 @@ Value DSearch::opp_node(Position& pos, int depth, int ply) {
 	// 詰ます手を選んでくれるとは限らないし、避けてくれるとも限らない。
 	// それは期待値として上の混合に入っているのが正しい。
 	//
-	// ただし**クランプは squash_cp と同じ ±3000 まで許す**。ここを ±2500 に
-	// 潰していたため、ply=1 より深くで見つけた詰み(子が ±3000 で返ってくる)が
-	// 通常評価の上限と同じ値になり、oppmodel を有効にすると詰み筋が
-	// 「ふつうの優勢」に見えて選ばれなくなっていた
-	// (例: p_legal 0.95 の詰み 2375 < p_legal 1.0 のふつうの優勢 2500)。
-	// この値は既に squash 済みの空間にいるので、think() 側では rootMixed を見て
+	// クランプは **±MIX_MAX(2900)**。2つの理由がある:
+	//   - ±2500 に潰すと、ply=1 より深くで見つけた詰みが通常評価の上限と同じ値になり、
+	//     詰み筋が「ふつうの優勢」に見えて選ばれなくなる
+	//     (例: p_legal 0.95 の詰み 2375 < p_legal 1.0 のふつうの優勢 2500)
+	//   - かといって ±MATE_MIX(3000)まで許すと、**上で引いた反則項のせいで
+	//     ただの優勢が飽和して 3000 に届き、証明された詰みと同点になる**。
+	//     反則項は常に v を下げるので、相手視点で大きく負けている局面が
+	//     −3000 に張り付く。それは squash_cp が詰みに使う符号そのもので、
+	//     think() の 0〜4cp の乱数タイブレークが詰みでない手を詰みより上に置きうる。
+	// MIX_MAX と MATE_MIX の 100cp の余白がこの衝突を防ぐ。
+	//
+	// この値は既に混合空間にいるので、think() 側では rootMixed を見て
 	// 二重に squash しないこと。
 	if (ply == 1)
 		rootMixed = true;
-	return Value(int(std::clamp(v, -3000.0, 3000.0)));
+	return Value(int(std::clamp(v, -MIX_MAX, MIX_MAX)));
 }
 
 Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply) {
