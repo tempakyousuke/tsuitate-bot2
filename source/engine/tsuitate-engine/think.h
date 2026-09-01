@@ -38,11 +38,22 @@ public:
 	                  const std::vector<Move>& foulTried, int budgetMs,
 	                  const Config& cfg, PRNG& rng);
 
+	// 対局開始時に呼ぶ。探索コンテキスト(置換表・history)を破棄して、
+	// 前の対局のエントリが次の対局に持ち越されないようにする
+	// (world(手番色・反則経済)が違う対局の値でカットオフさせない)。
+	void new_game() {
+		ctx_.clear();
+		thinkStamp_ = 0;
+	}
+
 private:
 	// §3.2 ワーカースレッドごとの探索コンテキスト(置換表 + history)。
 	// cfg.tt != 0 のときだけ確保する。手番をまたいで保持し、世代で無効化する
 	// (詳細は dsearch.h の SearchContext)。
 	std::vector<std::unique_ptr<SearchContext>> ctx_;
+	// think() の通し番号。SearchContext::stamp と突き合わせて
+	// 「この think でもう begin_think したか」をワーカー自身が判定する。
+	uint32_t thinkStamp_ = 0;
 };
 
 // ---------------------------------------------------------------------------

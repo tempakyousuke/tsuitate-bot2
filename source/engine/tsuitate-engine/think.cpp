@@ -240,18 +240,25 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	    cfg.foulGainScale * foul_value(cfg.foulBaseCp, cfg.foulStepCp, view.oppFouls);
 
 	// §3.2: 探索コンテキスト(置換表 + history)。ワーカースレッドごとに1つ。
-	// 世代を進めて前手番の値によるカットオフを無効化する(オーダリングには残る)。
-	const int nWorkers = std::max(1, cfg.threads);
-	if (cfg.tt) {
+	// begin_think(初回の16MB割り当て・世代進め・history半減)は呼び出し
+	// スレッドでまとめてやらず、各ワーカーが最初に ctx を要求した時点で行う
+	// (全ワーカー分のゼロ初期化と first-touch を1スレッドに直列に乗せない)。
+	const int nWorkers = effective_threads(cfg);
+	++thinkStamp_;
+	if (cfg.tt)
 		while (int(ctx_.size()) < nWorkers)
 			ctx_.push_back(std::make_unique<SearchContext>());
-		for (int w = 0; w < nWorkers; ++w) {
-			ctx_[w]->ensure();
-			ctx_[w]->new_search();
-		}
-	}
 	auto ctx_for = [&](int w) -> SearchContext* {
-		return cfg.tt ? ctx_[size_t(w)].get() : nullptr;
+		if (!cfg.tt)
+			return nullptr;
+		SearchContext* c = ctx_[size_t(w)].get();
+		// コンテキストは1リージョン内では担当ワーカーだけが触り、リージョン間は
+		// run_workers の join が順序づけるので、素の比較で足りる(競合しない)。
+		if (c->stamp != thinkStamp_) {
+			c->stamp = thinkStamp_;
+			c->begin_think();
+		}
+		return c;
 	};
 
 	// 妨害マップ(相手の反則を誘う配置への加点)。合法だったときにだけ効くので
@@ -351,7 +358,7 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		for (auto& a : cnt1)
 			a.store(0, std::memory_order_relaxed);
 
-		run_workers(cfg.threads, [&](int w) {
+		run_workers(nWorkers, [&](int w) {
 			SearchContext* sctx = ctx_for(w);
 			uint64_t myNodes = 0;
 			while (true) {
@@ -371,9 +378,18 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 							break;
 						}
 					} else {
-						// stage1 の縮退: 締め切り間際は各候補1サンプルへ絞る
-						if (now() > deadline - 100
-						    && cnt1[c].load(std::memory_order_relaxed) > 0)
+						// stage1 の縮退(逐次版の k1 段階縮退のミラー):
+						// 予算の 7/10 を過ぎたら各候補4サンプルまで、
+						// 締め切り間際(deadline-100)は各候補1サンプルへ絞る。
+						// 逐次版はここで k1 自体を絞るが、並列版はワークロードを
+						// パス開始時に固定するので、実行時にジョブを間引いて同じ
+						// 縮退を実現する(でないと 7/10 以降も全サンプルを回し続け、
+						// 鋭い局面で stage2 の時間窓を食い潰す)。
+						const TimePoint tn = now();
+						const int have = cnt1[c].load(std::memory_order_relaxed);
+						if (tn > deadline - 100 && have > 0)
+							continue;
+						if (tn > t0 + budgetMs * 7 / 10 && have >= 4)
 							continue;
 					}
 					const Move m = cands[candIdx[c]];
@@ -426,7 +442,7 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	// 4) stage1: 全候補を静止探索で粗く評価。
 	// 締め切りが迫ったらサンプル数を段階的に絞る(全候補に必ず何らかの値を付ける)
 	std::vector<double> mean1(M, 0.0), comb1(M);
-	if (cfg.threads > 1) {
+	if (nWorkers > 1) {
 		// 並列版はワークロードをパス開始時に固定する(逐次版の候補ごとの縮退は
 		// parallel_eval 内の「締め切り間際は各候補1サンプル」で代替)
 		size_t k1 = size_t(cfg.stage1Samples);
@@ -449,45 +465,51 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 			mean1[i] = cnt[i] ? sum[i] / double(cnt[i]) : 0.0;
 			comb1[i] = combined(i, mean1[i]);
 		}
-	} else
-	for (size_t i = 0; i < M; ++i) {
-		size_t k1 = size_t(cfg.stage1Samples);
-		TimePoint t = now();
-		if (t > deadline - 100)
-			k1 = 1;
-		else if (t > t0 + budgetMs * 7 / 10)
-			k1 = std::min<size_t>(k1, 4);
-		auto sel = pick_particles(legalIdx[i], k1);
-		double sum = 0;
-		for (uint32_t j : sel) {
-			Position& pos = parts[j]->pos;
-			StateInfo st;
-			DSearch ds;
-			ds.nodesLimit = 20000;
-			ds.cfg = &cfg;
-			ds.us = view.us;
-			ds.foulGain = foulGain;
-			ds.ctx = ctx_for(0);
-			ds.oppK1 = cfg.oppReplyKStage1;
-			pos.do_move(cands[i], st);
-			// stage1 は本来この一手ぶんの静止探索だけで粗く序列化する段。
-			// ただし千里眼のqsearchは「進めた駒は必ず取られる」と読むので、
-			// 相手モデルを入れたい前進手が上位12手に残らずstage2に届かない。
-			// oppReplyKStage1 > 0 なら深さ1の探索(= 相手ノード1つ + その子のqsearch)に
-			// 差し替えて、序列化にも同じ相手モデルを効かせる。
-			Value v;
-			if (cfg.oppModel > 0 && cfg.oppReplyKStage1 > 0)
-				v = -ds.search(pos, 1, -VALUE_INFINITE, VALUE_INFINITE, 1);
-			else
-				v = -ds.qsearch(pos, -VALUE_INFINITE, VALUE_INFINITE, 1);
-			pos.undo_move(cands[i]);
-			// 相手ノードが確率混合を返したときは、その値は既に squash 済みの空間に
-			// いるので二重に squash しない(詰みが通常評価の上限に潰れる)。
-			sum += ds.rootMixed ? double(v) : squash_cp(v);
-			res.nodes += ds.nodes;
+	} else {
+		// 逐次版(threads 1 の対照経路。並列版と本体を統一しないのは、
+		// (a) 候補ごとに now() を見て k1 を絞る縮退の意味論が並列と異なる、
+		// (b) 浮動小数の加算順が変わると対照側の挙動が1ulpでも動くため。
+		// ブレースで囲ってあるのは、`} else` + 裸の for だと後から文を足したとき
+		// 分岐の外に置いてしまう編集事故が起きやすいため)
+		for (size_t i = 0; i < M; ++i) {
+			size_t k1 = size_t(cfg.stage1Samples);
+			TimePoint t = now();
+			if (t > deadline - 100)
+				k1 = 1;
+			else if (t > t0 + budgetMs * 7 / 10)
+				k1 = std::min<size_t>(k1, 4);
+			auto sel = pick_particles(legalIdx[i], k1);
+			double sum = 0;
+			for (uint32_t j : sel) {
+				Position& pos = parts[j]->pos;
+				StateInfo st;
+				DSearch ds;
+				ds.nodesLimit = 20000;
+				ds.cfg = &cfg;
+				ds.us = view.us;
+				ds.foulGain = foulGain;
+				ds.ctx = ctx_for(0);
+				ds.oppK1 = cfg.oppReplyKStage1;
+				pos.do_move(cands[i], st);
+				// stage1 は本来この一手ぶんの静止探索だけで粗く序列化する段。
+				// ただし千里眼のqsearchは「進めた駒は必ず取られる」と読むので、
+				// 相手モデルを入れたい前進手が上位12手に残らずstage2に届かない。
+				// oppReplyKStage1 > 0 なら深さ1の探索(= 相手ノード1つ + その子のqsearch)に
+				// 差し替えて、序列化にも同じ相手モデルを効かせる。
+				Value v;
+				if (cfg.oppModel > 0 && cfg.oppReplyKStage1 > 0)
+					v = -ds.search(pos, 1, -VALUE_INFINITE, VALUE_INFINITE, 1);
+				else
+					v = -ds.qsearch(pos, -VALUE_INFINITE, VALUE_INFINITE, 1);
+				pos.undo_move(cands[i]);
+				// 相手ノードが確率混合を返したときは、その値は既に squash 済みの空間に
+				// いるので二重に squash しない(詰みが通常評価の上限に潰れる)。
+				sum += ds.rootMixed ? double(v) : squash_cp(v);
+				res.nodes += ds.nodes;
+			}
+			mean1[i] = sel.empty() ? 0.0 : sum / double(sel.size());
+			comb1[i] = combined(i, mean1[i]);
 		}
-		mean1[i] = sel.empty() ? 0.0 : sum / double(sel.size());
-		comb1[i] = combined(i, mean1[i]);
 	}
 
 	// 5) stage2: 上位候補を深く読む(時間があれば深さを上げる)
@@ -508,7 +530,7 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 			break;
 		std::vector<double> pass(M, 0.0);
 		bool aborted = false;
-		if (cfg.threads > 1) {
+		if (nWorkers > 1) {
 			std::vector<std::vector<uint32_t>> sels(top.size());
 			for (size_t t = 0; t < top.size(); ++t)
 				sels[t] = pick_particles(legalIdx[top[t]], size_t(cfg.stage2Samples));
@@ -521,32 +543,34 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 					size_t i = top[t];
 					pass[i] = cnt[t] > 0 ? combined(i, sum[t] / double(cnt[t])) : comb1[i];
 				}
-		} else
-		for (size_t i : top) {
-			auto sel = pick_particles(legalIdx[i], size_t(cfg.stage2Samples));
-			double sum = 0;
-			size_t cnt = 0;
-			for (uint32_t j : sel) {
-				if (now() > deadline - 50) { aborted = true; break; }
-				Position& pos = parts[j]->pos;
-				StateInfo st;
-				DSearch ds;
-				ds.nodesLimit = 60000;
-				ds.cfg        = &cfg;
-				ds.us         = view.us;
-				ds.foulGain   = foulGain;
-				ds.ctx        = ctx_for(0);
-				pos.do_move(cands[i], st);
-				Value v = -ds.search(pos, d - 1, -VALUE_INFINITE, VALUE_INFINITE, 1);
-				pos.undo_move(cands[i]);
-				// 上と同じ理由で、混合値は二重に squash しない
-				sum += ds.rootMixed ? double(v) : squash_cp(v);
-				++cnt;
-				res.nodes += ds.nodes;
+		} else {
+			// 逐次版(stage1 と同じ理由で分けたまま。ブレースも同様)
+			for (size_t i : top) {
+				auto sel = pick_particles(legalIdx[i], size_t(cfg.stage2Samples));
+				double sum = 0;
+				size_t cnt = 0;
+				for (uint32_t j : sel) {
+					if (now() > deadline - 50) { aborted = true; break; }
+					Position& pos = parts[j]->pos;
+					StateInfo st;
+					DSearch ds;
+					ds.nodesLimit = 60000;
+					ds.cfg        = &cfg;
+					ds.us         = view.us;
+					ds.foulGain   = foulGain;
+					ds.ctx        = ctx_for(0);
+					pos.do_move(cands[i], st);
+					Value v = -ds.search(pos, d - 1, -VALUE_INFINITE, VALUE_INFINITE, 1);
+					pos.undo_move(cands[i]);
+					// 上と同じ理由で、混合値は二重に squash しない
+					sum += ds.rootMixed ? double(v) : squash_cp(v);
+					++cnt;
+					res.nodes += ds.nodes;
+				}
+				pass[i] = cnt > 0 ? combined(i, sum / double(cnt)) : comb1[i];
+				if (aborted)
+					break;
 			}
-			pass[i] = cnt > 0 ? combined(i, sum / double(cnt)) : comb1[i];
-			if (aborted)
-				break;
 		}
 		if (!aborted) {
 			// パスを完走したときだけ採用する(部分的な値で序列を壊さない)
@@ -587,6 +611,7 @@ void BotCore::new_game(Color us, const Config& cfg) {
 	view_.reset(us);
 	hist_.clear(us);
 	belief_.reset(us, cfg);
+	thinker_.new_game();  // 置換表・historyを破棄(前対局の値を持ち越さない)
 	foulTried_.clear();
 }
 

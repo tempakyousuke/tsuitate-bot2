@@ -694,19 +694,27 @@ void Belief::force_resynthesize(const OwnView& view, TimePoint deadline) {
 	                         std::max<size_t>(16, size_t(cfg_.particles) / 4));
 	// synthesize は1回あたり最大30試行回るので、回数だけでなく時計でも止める
 	// (sync が予算を使ったあとに呼ばれるため、ここで時間切れを起こしうる)。
-	if (cfg_.threads > 1) {
-		// 並列版: 続行判定(共有カウンタ)だけロックの中で行い、synthesize 本体は
-		// ワーカーごとの PRNG でロックなしに走らせる。判定の規則は逐次版と同じ。
+	//
+	// 逐次と並列で本体を分けない: run_workers(1) は fn(0) をその場で呼ぶだけなので
+	// ワーカー本体がそのまま逐次版になる(ロックは無競合なら実質タダ)。
+	// nw==1 のときは rng_ を直接使い、乱数の消費列を従来の逐次実装と同一に保つ。
+	// 続行判定(共有カウンタ)はロックの中、synthesize 本体はロックの外。
+	{
+		const int nw = effective_threads(cfg_);
 		std::mutex mu;
 		int misses = 0;
-		const uint64_t base = rng_.rand<uint64_t>();
-		run_workers(cfg_.threads, [&](int w) {
-			PRNG rng((base ^ (uint64_t(w) * 0x9e3779b97f4a7c15ull)) | 1);
+		const uint64_t base = nw > 1 ? rng_.rand<uint64_t>() : 0;
+		run_workers(nw, [&](int w) {
+			PRNG  local((base ^ (uint64_t(w) * 0x9e3779b97f4a7c15ull)) | 1);
+			PRNG& rng = nw > 1 ? local : rng_;
 			while (true) {
 				{
 					std::lock_guard<std::mutex> lk(mu);
 					if (parts_.size() >= target || misses >= 400)
 						return;
+					// 締め切りを過ぎていても、1粒子も作れていないうちは少しだけ粘る
+					// (空の信念で戻ると呼び出し側が手を選べなくなる)。ただし無制限には
+					// しない ―― 絞らないと 400ミス×30試行ぶん予算を食い潰しうる。
 					if (now() >= deadline && (!parts_.empty() || misses >= 40))
 						return;
 				}
@@ -718,20 +726,6 @@ void Belief::force_resynthesize(const OwnView& view, TimePoint deadline) {
 					++misses;
 			}
 		});
-	} else {
-		int misses = 0;
-		while (parts_.size() < target && misses < 400) {
-			// 締め切りを過ぎていても、1粒子も作れていないうちは少しだけ粘る
-			// (空の信念で戻ると呼び出し側が手を選べなくなる)。ただし無制限にはしない
-			// ―― 粘る回数を絞らないと 400ミス×30試行ぶん予算を食い潰しうる。
-			if (now() >= deadline && (!parts_.empty() || misses >= 40))
-				break;
-			auto p = synthesize(view, rng_);
-			if (p)
-				parts_.push_back(std::move(p));
-			else
-				++misses;
-		}
 	}
 	relaxMean_  = relax_mean();
 	relaxLevel_ = int(relaxMean_ + 0.5);
@@ -872,23 +866,33 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 	TimePoint ladderEnd = t0 + total * 4 / 5;
 	TimePoint gate[3] = { t0 + total * 2 / 5, t0 + total * 3 / 5, ladderEnd };
 
-	if (cfg_.threads > 1) {
-		// --- 並列再生成(§3.1) ---
-		// ワーカーごとに (基準乱数, workerId) から導出した独立の PRNG でリプレイし、
-		// 完成粒子は mutex で回収する。墓場(graveyard_)は再生成中に書かれない
-		// (bury は apply_event の中でしか呼ばれない)ので、ロックなしで読んでよい。
-		// ラダーのエスカレーション(relaxレベル・失敗数・時間門)は共有状態として
-		// ロックの中で判定する = 規則は逐次版と同一。
-		//
-		// 逐次版と乱数の消費列は揃えない(粒子の中身は並びも含めて変わる)。
-		// threads は挙動が変わり得るフラグとして扱い、A/B は threads 同士で行うこと。
+	// --- 再生成ラダー(逐次・並列共通の1実装) ---
+	// run_workers(1) は fn(0) をその場で呼ぶだけなので、ワーカー本体がそのまま
+	// 逐次版になる(二重実装だとラダーの調整定数の変更が片側にしか入らず、
+	// A/Bの対照(threads 1)と配備(threads>1)のアルゴリズムが乖離する)。
+	// nw==1 のときは rng_ を直接使い、乱数の消費列を従来の逐次実装と同一に保つ。
+	//
+	// 並列時(nw>1)の注意:
+	//   - ワーカーごとに (基準乱数, workerId) から導出した独立 PRNG を使い、
+	//     完成粒子は mutex で回収する。墓場(graveyard_)は再生成中に書かれない
+	//     (bury は apply_event の中でしか呼ばれない)ので、ロックなしで読んでよい
+	//   - エスカレーション(relaxレベル・失敗数・時間門)は共有状態としてロックの
+	//     中で判定する。fails の更新は「そのジョブを発行したときの relax レベルが
+	//     いまも現行レベルであるとき」に限る ―― エスカレーションをまたいで
+	//     生き残った旧レベルのジョブの結果を新レベルの失敗予算に混ぜると、
+	//     部分若返り幅(RS)と 400 打ち切りが逐次版の規則より早く進んでしまう
+	//   - 乱数の消費列は逐次版と揃えない(粒子の中身は並びも含めて変わる)。
+	//     threads は挙動が変わり得るフラグとして扱い、A/B は threads 同士で行うこと
+	{
+		const int nw = effective_threads(cfg_);
 		std::mutex mu;
 		int relax = 0;
 		int fails = 0;
 		int tries = 0;
-		const uint64_t base = rng_.rand<uint64_t>();
-		run_workers(cfg_.threads, [&](int w) {
-			PRNG rng((base ^ (uint64_t(w) * 0x9e3779b97f4a7c15ull)) | 1);
+		const uint64_t base = nw > 1 ? rng_.rand<uint64_t>() : 0;
+		run_workers(nw, [&](int w) {
+			PRNG  local((base ^ (uint64_t(w) * 0x9e3779b97f4a7c15ull)) | 1);
+			PRNG& rng = nw > 1 ? local : rng_;
 			while (true) {
 				int    myRelax;
 				size_t myFails;
@@ -930,6 +934,7 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 				size_t      failIdx = 0;
 				if (seed) {
 					static const size_t RS[4] = {2, 4, 8, 16};
+					// 失敗が続くほど幅を広げる(戻さない)
 					size_t r = RS[std::min<size_t>(3, myFails / 25)];
 					p = replay_one(hist, myRelax, rng, seed, r, &failIdx);
 				} else {
@@ -937,65 +942,21 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 				}
 				{
 					std::lock_guard<std::mutex> lk(mu);
+					// fails は現行レベルのジョブの結果だけで動かす(上のコメント)。
+					// nw==1 では常に myRelax == relax なので逐次版と同一。
 					if (p) {
 						parts_.push_back(std::move(p));
-						fails = 0;
+						if (myRelax == relax)
+							fails = 0;
 					} else {
-						++fails;
+						if (myRelax == relax)
+							++fails;
 						failHist_[std::min<size_t>(failIdx < cursor_ ? cursor_ - 1 - failIdx : 0, 15)]++;
 						failKind_[size_t(hist.events[failIdx].kind)]++;
 					}
 				}
 			}
 		});
-	} else {
-	int relax = 0;
-	int fails = 0;
-	int tries = 0;
-	while (tries < cfg_.regenTries) {
-		size_t target = relax == 0 ? want : hardMin;
-		if (parts_.size() >= target)
-			break;
-		bool exhausted = now() >= gate[relax] || fails >= 400;
-		if (exhausted) {
-			// 厳密粒子が最低限あるなら緩和はしない(緩和粒子は推定を汚す)
-			if (parts_.size() >= hardMin || relax >= 2)
-				break;
-			++relax;
-			fails = 0;
-			continue;
-		}
-		++tries;
-		ParticlePtr p;
-		size_t failIdx = 0;
-		// 種の質 = 長さ(どこまで観測と整合して生きたか)。長い種を優先する。
-		size_t maxLen = 0;
-		for (const auto& s : graveyard_)
-			maxLen = std::max(maxLen, s.size());
-		const std::vector<Move>* seed = nullptr;
-		if (!graveyard_.empty() && (tries % 13) != 0) {
-			// 最長クラスの種が引けるまで数回引き直す
-			for (int k = 0; k < 8; ++k) {
-				const auto& s = graveyard_[rng_.rand<uint64_t>() % graveyard_.size()];
-				if (s.size() + 2 >= maxLen) { seed = &s; break; }
-			}
-		}
-		if (seed) {
-			static const size_t RS[4] = {2, 4, 8, 16};
-			size_t r = RS[std::min<size_t>(3, fails / 25)];  // 失敗が続くほど幅を広げる(戻さない)
-			p = replay_one(hist, relax, rng_, seed, r, &failIdx);
-		} else {
-			p = replay_one(hist, relax, rng_, nullptr, 0, &failIdx);
-		}
-		if (p) {
-			parts_.push_back(std::move(p));
-			fails = 0;
-		} else {
-			++fails;
-			failHist_[std::min<size_t>(failIdx < cursor_ ? cursor_ - 1 - failIdx : 0, 15)]++;
-			failKind_[size_t(hist.events[failIdx].kind)]++;
-		}
-	}
 	}
 	relaxMean_  = relax_mean();
 	relaxLevel_ = int(relaxMean_ + 0.5);
@@ -1004,38 +965,30 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 	// リプレイでは再現できない稀な相手の指し回しに遭遇したときの保険で、
 	// 「駒勘定と王手状態だけ合う配置」でも 0粒子(当てずっぽう)よりはるかにまし。
 	if (parts_.size() < hardMin) {
+		// 逐次・並列共通の1実装(上のラダーと同じ理屈。nw==1 は rng_ を直接使う)
 		size_t synthTarget = std::max(hardMin, want / 4);
-		if (cfg_.threads > 1) {
-			std::mutex mu;
-			int misses = 0;
-			const uint64_t base = rng_.rand<uint64_t>();
-			run_workers(cfg_.threads, [&](int w) {
-				PRNG rng((base ^ (uint64_t(w) * 0x9e3779b97f4a7c15ull)) | 1);
-				while (true) {
-					{
-						std::lock_guard<std::mutex> lk(mu);
-						if (!(parts_.size() < synthTarget && misses < 200
-						      && now() < deadline + 100))
-							return;
-					}
-					auto p = synthesize(view, rng);
+		const int nw = effective_threads(cfg_);
+		std::mutex mu;
+		int misses = 0;
+		const uint64_t base = nw > 1 ? rng_.rand<uint64_t>() : 0;
+		run_workers(nw, [&](int w) {
+			PRNG  local((base ^ (uint64_t(w) * 0x9e3779b97f4a7c15ull)) | 1);
+			PRNG& rng = nw > 1 ? local : rng_;
+			while (true) {
+				{
 					std::lock_guard<std::mutex> lk(mu);
-					if (p)
-						parts_.push_back(std::move(p));
-					else
-						++misses;
+					if (!(parts_.size() < synthTarget && misses < 200
+					      && now() < deadline + 100))
+						return;
 				}
-			});
-		} else {
-			int misses = 0;
-			while (parts_.size() < synthTarget && misses < 200 && now() < deadline + 100) {
-				auto p = synthesize(view, rng_);
+				auto p = synthesize(view, rng);
+				std::lock_guard<std::mutex> lk(mu);
 				if (p)
 					parts_.push_back(std::move(p));
 				else
 					++misses;
 			}
-		}
+		});
 		relaxMean_  = relax_mean();
 		relaxLevel_ = int(relaxMean_ + 0.5);
 	}

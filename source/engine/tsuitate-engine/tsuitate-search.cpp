@@ -425,6 +425,10 @@ private:
 			          << " p_legal=" << int(r.pLegal * 100) << "%"
 			          << " cp=" << int(r.expectedCp)
 			          << " depth=" << r.depthReached
+			          // nodes/knps は §3.1/§3.2 の採用ゲート指標。アリーナ診断にしか
+			          // 出さないと、配備(ブリッジ経由)でのスループット退行が見えない
+			          << " nodes=" << r.nodes
+			          << " knps=" << (r.elapsedMs > 0 ? (long long) (r.nodes / (uint64_t) r.elapsedMs) : 0)
 			          << " time=" << r.elapsedMs << "ms" << sync_endl;
 		if (r.best == Move::none())
 			sync_cout << "bestmove resign" << sync_endl;

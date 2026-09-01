@@ -19,7 +19,7 @@
  */
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { availableParallelism } from 'node:os';
 import { createInterface } from 'node:readline';
@@ -109,23 +109,67 @@ class Engine {
 	}
 }
 
+// TSUITATE_ENGINE_OPTS は一度だけパースし、「指定済みキーの判定」と「送信」の
+// 両方に同じ結果を使う(判定だけ別のregexで再実装すると、区切り規則が
+// ずれたときに明示設定を黙って上書き/自動設定を黙って欠落させる)。
+const engineOpts = engineOptions
+	.split(',')
+	.map((s) => s.trim())
+	.filter(Boolean)
+	.map((kv) => kv.replace(/[=:]/g, ' '));
+const engineOptNames = new Set(engineOpts.map((kv) => kv.split(/\s+/)[0]));
+const engineOptValue = (name: string): string | undefined =>
+	engineOpts.find((kv) => kv.split(/\s+/)[0] === name)?.split(/\s+/)[1];
+
+// 利用可能CPU数。availableParallelism() は cgroup の CPU クォータ(cpu.max /
+// cfs_quota)を反映しない(affinity ベース)ので、クォータ制限つきコンテナでは
+// ホストのコア数を返してしまう。クォータも読んで小さいほうを使う。
+// クォータでコア数を絞ったコンテナで過剰にスレッドを立てると、締め切り判定が
+// スケジュールされたときにしか走らず think が予算を超過する。
+function cgroupCpuQuota(): number | null {
+	try {
+		// cgroup v2: "<quota> <period>" または "max <period>"
+		const m = readFileSync('/sys/fs/cgroup/cpu.max', 'utf8').trim().split(/\s+/);
+		if (m[0] !== 'max') {
+			const quota = Number(m[0]);
+			const period = Number(m[1] ?? 100000);
+			if (quota > 0 && period > 0) return Math.max(1, Math.floor(quota / period));
+		}
+		return null;
+	} catch {
+		/* v2 でない・読めない → v1 を試す */
+	}
+	try {
+		const q = Number(readFileSync('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'utf8'));
+		const p = Number(readFileSync('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'utf8'));
+		if (q > 0 && p > 0) return Math.max(1, Math.floor(q / p));
+	} catch {
+		/* 読めなければクォータなし扱い */
+	}
+	return null;
+}
+
 const engine = new Engine(enginePath);
 engine.send('usi');
-// 既定でCPUコアぶんのワーカースレッドを使う(§3.1 粒子並列。4コアで実効3.8倍)。
-// TSUITATE_ENGINE_OPTS に threads の指定があればそちらを優先する。
-if (!/(^|,)\s*threads[\s=:]/.test(engineOptions)) {
-	const n = Math.max(1, Math.min(availableParallelism(), 16));
-	engine.send(`set threads ${n}`);
-	// 並列時は思考予算の配分を信念側へ寄せる(syncpct 40 → 55)。
-	// 探索だけ4倍にすると攻撃性と反則コストの均衡が壊れる(60局で43.3%)が、
-	// 増えた計算の一部を信念に戻すと 66.7%(z=+2.84)でゲート通過
-	// (docs/strengthening.md 3.4章)。syncpct の明示指定があれば優先する。
-	if (n > 1 && !/(^|,)\s*syncpct[\s=:]/.test(engineOptions)) engine.send('set syncpct 55');
+
+// 既定でCPUぶんのワーカースレッドを使う(§3.1 粒子並列。4コアで実効3.8倍)。
+// threads の明示指定があればその値を尊重する(自動設定はしない)。
+let effectiveThreads: number;
+if (engineOptNames.has('threads')) {
+	effectiveThreads = Math.max(1, Number(engineOptValue('threads')) || 1);
+} else {
+	const quota = cgroupCpuQuota();
+	effectiveThreads = Math.max(1, Math.min(availableParallelism(), quota ?? Infinity, 16));
+	engine.send(`set threads ${effectiveThreads}`);
 }
-for (const opt of engineOptions.split(',')) {
-	const kv = opt.trim();
-	if (kv) engine.send(`set ${kv.replace(/[=:]/g, ' ')}`);
-}
+// 並列時は思考予算の配分を信念側へ寄せる(syncpct 40 → 55)。
+// 探索だけ並列化すると攻撃性と反則コストの均衡が壊れる(120局で43.3%)が、
+// 増えた計算の一部を信念に戻すと 61.7%(z=+2.74)でゲート通過
+// (docs/strengthening.md 3.4章)。この対は「実効スレッド数 > 1」で判定する ——
+// threads を明示指定した場合にも適用しないと、並列化だけ opt-in して
+// 較正が外れた 43.3% 構成に落ちる。syncpct の明示指定があればそちらを優先。
+if (effectiveThreads > 1 && !engineOptNames.has('syncpct')) engine.send('set syncpct 55');
+for (const kv of engineOpts) engine.send(`set ${kv}`);
 
 // ---------------------------------------------------------------------------
 // Socket.IO 接続と対局ループ

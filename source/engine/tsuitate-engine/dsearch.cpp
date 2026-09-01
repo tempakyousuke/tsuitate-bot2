@@ -59,7 +59,8 @@ double squash_for_mix(Value v) {
 // 詰みスコアは「rootからの距離」を含むので、そのまま保存すると別の深さから
 // 再利用したときに距離がずれる。保存時は「このノードからの距離」に直し(to_tt)、
 // 読むときに現在の ply を足し戻す(from_tt)。
-enum : uint8_t { TT_UPPER = 0, TT_LOWER = 1, TT_EXACT = 2 };
+// bound は types.h の共通 enum Bound を使う(独自enumを切ると数値が本体の
+// BOUND_* とずれ、コピー適応したコードやデバッグ出力が静かに誤分類する)。
 
 int16_t value_to_tt(Value v, int ply) {
 	if (v >= VALUE_MATE_IN_MAX_PLY)
@@ -381,9 +382,9 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 			ttRaw = tte->move16;
 			if (tte->gen == ctx->gen && tte->depth >= depth) {
 				Value v = value_from_tt(tte->value, ply);
-				if (tte->bound == TT_EXACT
-				    || (tte->bound == TT_LOWER && v >= beta)
-				    || (tte->bound == TT_UPPER && v <= alpha))
+				if (tte->bound == BOUND_EXACT
+				    || (tte->bound == BOUND_LOWER && v >= beta)
+				    || (tte->bound == BOUND_UPPER && v <= alpha))
 					return v;
 			}
 		}
@@ -412,9 +413,9 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 			} else if (!m.is_drop() && pos.piece_on(m.to_sq()) != NO_PIECE) {
 				s = (1 << 20) + order_score(pos, m);
 			} else {
-				if (m == killer[ply][0])
+				if (m == ctx->killer[ply][0])
 					s = (1 << 18);
-				else if (m == killer[ply][1])
+				else if (m == ctx->killer[ply][1])
 					s = (1 << 18) - 1;
 				else
 					s = ctx->hist_of(pos.side_to_move(), m.raw());
@@ -445,9 +446,9 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 				if (alpha >= beta) {
 					// beta カット: quiet なら killer / history を更新
 					if (ctx && (m.is_drop() || pos.piece_on(m.to_sq()) == NO_PIECE)) {
-						if (killer[ply][0] != m) {
-							killer[ply][1] = killer[ply][0];
-							killer[ply][0] = m;
+						if (ctx->killer[ply][0] != m) {
+							ctx->killer[ply][1] = ctx->killer[ply][0];
+							ctx->killer[ply][0] = m;
 						}
 						int16_t& h = ctx->hist_of(pos.side_to_move(), m.raw());
 						h = int16_t(std::min<int>(SearchContext::HIST_MAX,
@@ -473,7 +474,7 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 			// オーダリングのヒントとしては十分機能するので保存する
 			tte->move16 = bestMove.raw();
 			tte->depth  = int8_t(std::min(depth, 127));
-			tte->bound  = best >= beta ? TT_LOWER : best > alphaOrig ? TT_EXACT : TT_UPPER;
+			tte->bound  = best >= beta ? BOUND_LOWER : best > alphaOrig ? BOUND_EXACT : BOUND_UPPER;
 			tte->gen    = ctx->gen;
 		}
 	}

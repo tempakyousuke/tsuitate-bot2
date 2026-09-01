@@ -28,14 +28,19 @@ namespace Tsuitate {
 // **同世代のエントリだけ**に許す: 局面評価は手番内では純粋に (局面, 深さ) の
 // 関数だが、手番をまたぐと oppFouls に依存する項(foulGain)が変わりうるため。
 // 旧世代のエントリは指し手のオーダリングにだけ使う(こちらは値が古くても無害)。
+//
+// gen は uint16: uint8 だと think() 256回(反則のやり直しも1回と数えるので
+// 1局内でも到達しうる)で一巡し、256世代前のエントリが「同世代」に化けて
+// 別の foulGain / 別の対局で計算した値がカットオフに使われる。uint16 の一巡には
+// 1局で65536回の決定が要り、さらに対局開始(new_game)でコンテキストごと
+// 破棄されるので、実質到達不能。
 struct TTEntry {
 	uint64_t key   = 0;  // pos.key()(0 = 空きスロット)
 	int16_t  value = 0;  // value_to_tt 済み(詰みはply補正済み)
 	uint16_t move16 = 0; // 最善手(Move::raw()。オーダリング用)
 	int8_t   depth = -1;
-	uint8_t  bound = 0;  // 0=UPPER 1=LOWER 2=EXACT
-	uint8_t  gen   = 0;
-	uint8_t  pad   = 0;
+	Bound    bound = BOUND_NONE;  // types.h の共通enum(独自enumで数値をずらさない)
+	uint16_t gen   = 0;
 };
 static_assert(sizeof(TTEntry) == 16, "TTEntry should stay 16 bytes");
 
@@ -45,20 +50,33 @@ struct SearchContext {
 	std::vector<TTEntry> tt;
 	// history[手番(0=BLACK)][Move::raw()]。quietの beta カットで depth^2 を加点
 	std::vector<int16_t> hist;
-	uint8_t              gen = 0;
+	// killer もここに置く(ワーカーごと・think ごとにクリア)。DSearch のメンバに
+	// すると (候補,粒子) ジョブごとの構築で毎回 ~2KB のゼロ初期化が走り、
+	// killer を一度も読まない既定(tt 0)経路まで恒常コストを払うことになる。
+	Move     killer[MAX_PLY][2];
+	uint16_t gen   = 0;
+	// この think() でもう begin_think 済みかの判定(Thinker が通し番号を発行)。
+	// コンテキストは1リージョン内では担当ワーカーだけが触り、リージョン間は
+	// run_workers の join が順序づけるので、単純な比較で足りる。
+	uint32_t stamp = 0;
 
-	void ensure() {
+	// think() ごと・ワーカーごとに1回。
+	//   - 初回は割り当て(16MB)をここで行う: 呼び出しスレッドで全ワーカー分を
+	//     まとめて確保すると、初手の予算内で workers×16MB のゼロ初期化と
+	//     first-touch が直列に走ってしまう。ワーカー自身にやらせて分散する
+	//   - 2回目以降は世代を進めて前手番の値カットオフを無効化し、history は
+	//     半減させる(減衰なしだと長い対局で飽和して序列の分解能が落ちる)
+	void begin_think() {
 		if (tt.empty()) {
 			tt.resize(size_t(1) << TT_BITS);
 			hist.assign(2 * 65536, 0);
+		} else {
+			++gen;
+			for (auto& h : hist)
+				h = int16_t(h / 2);
 		}
-	}
-	// think() ごとに1回呼ぶ。世代を進めて前手番の値カットオフを無効化し、
-	// history は半減させる(減衰なしだと長い対局で飽和して序列の分解能が落ちる)。
-	void new_search() {
-		++gen;
-		for (auto& h : hist)
-			h = int16_t(h / 2);
+		for (int p = 0; p < MAX_PLY; ++p)
+			killer[p][0] = killer[p][1] = Move::none();
 	}
 	TTEntry& slot(uint64_t key) { return tt[key & ((size_t(1) << TT_BITS) - 1)]; }
 	int16_t& hist_of(Color side, uint16_t raw16) {
@@ -86,9 +104,8 @@ struct DSearch {
 
 	// --- §3.2 置換表 + オーダリング(cfg->tt != 0 のときだけ think() が設定する) ---
 	// nullptr なら従来の探索(MVV-LVAのみ)と完全に同一の経路。
-	// killer はジョブ内(この DSearch の探索木)ローカルなのでここに持つ。
+	// killer は ctx 側(ワーカーごと、think ごとにクリア)。
 	SearchContext* ctx = nullptr;
-	Move           killer[MAX_PLY][2] = {};  // ゼロ初期化 = Move::none()(MOVE_NONE==0)
 
 	// ply==1 の相手ノードが「確率混合の値」を返したか(呼び出しごとに1回だけ立つ)。
 	//

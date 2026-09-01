@@ -360,6 +360,13 @@ double foul_value(double baseCp, double stepCp, int fouls);
 //   - 乱数が要るワーカーには (基準seed, workerId) から導出した独立の PRNG を渡す
 void run_workers(int nThreads, const std::function<void(int)>& fn);
 
+// 実効ワーカー数 = min(cfg.threads, ハードウェア並列度)。
+// threads はハードウェアより大きく設定できてしまうが、物理コアを超えた
+// ワーカーは生成コストとオーバーサブスクリプション(締め切り判定は
+// スケジュールされたときにしか走らない)で逆効果にしかならない。
+// hardware_concurrency() が 0(不明)を返す環境では設定値をそのまま使う。
+int effective_threads(const Config& cfg);
+
 // サイトのPieceRole文字列 <-> PieceType
 PieceType role_from_site(const std::string& s);
 std::string role_to_site(PieceType pt);

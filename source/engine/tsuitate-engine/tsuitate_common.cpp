@@ -424,6 +424,14 @@ void run_workers(int nThreads, const std::function<void(int)>& fn) {
 		t.join();
 }
 
+int effective_threads(const Config& cfg) {
+	int t = std::max(1, cfg.threads);
+	unsigned hw = std::thread::hardware_concurrency();
+	if (hw > 0)
+		t = std::min<int>(t, int(hw));
+	return t;
+}
+
 } // namespace Tsuitate
 } // namespace YaneuraOu
 
