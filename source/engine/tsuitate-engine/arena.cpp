@@ -482,6 +482,8 @@ void run_arena(const ArenaOptions& opt) {
 		          << " after_relax=" << g.foulsAfterRelax << "/" << g.decisionsAtRelax << ")";
 		// 探索スループット(§3.1/§3.2 の採用ゲート)。knps の分母は思考時間全体
 		// (信念の同期込み)なので、探索だけの nodes/s より低めに出る点に注意。
+		// 定義は ThinkResult::knps() と同じ「nodes/経過ms」(こちらは全決定の
+		// 合計同士の比 = 時間で重み付いたプール平均)。式を変えるときは両方揃えること。
 		std::cout << " avg_depth=" << (double(g.depthSum) / double(g.decisions))
 		          << " knps=" << (g.thinkMsSum > 0
 		                              ? double(g.nodesSum) / double(g.thinkMsSum) : 0.0);

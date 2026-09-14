@@ -281,7 +281,16 @@ struct Config {
 	int  synthPrior     = 1;
 	// 1手の思考予算のうち信念の同期・再生成に回す割合(%)。
 	// 反則が勝敗を決めるので、探索の深さより信念の質に配分するほうが利くことがある。
-	int  syncPct        = 40;
+	//
+	// 既定 -1 = auto: **実効**スレッド数(effective_threads)が2以上なら55、
+	// それ以外は40を使う(resolved_sync_pct)。探索だけ並列化すると攻撃性と
+	// 反則コストの均衡が壊れて勝率43.3%に沈み、増えた計算の一部を信念に戻すと
+	// 61.7%(z=+2.74)でゲートを通過した(docs/strengthening.md 3.4章)。
+	// この「threads>1 と syncpct 55 は対」という較正知識は起動側(ブリッジ等)に
+	// 置かない: 起動側は要求したスレッド数しか知らず、エンジン側のクランプ
+	// (ハードウェア並列度・cgroupクォータ)で実効値が変わると対が外れるため。
+	// 明示指定(0..100)があればそちらが優先。
+	int  syncPct        = -1;
 	// 粒子数が目標のこの割合(%)以上あれば再生成をまるごと省く。
 	// 低いと時間は浮くが人口が痩せたまま(=p_legalの分解能と信念の多様性が落ちる)。
 	int  regenFloorPct  = 50;
@@ -360,12 +369,27 @@ double foul_value(double baseCp, double stepCp, int fouls);
 //   - 乱数が要るワーカーには (基準seed, workerId) から導出した独立の PRNG を渡す
 void run_workers(int nThreads, const std::function<void(int)>& fn);
 
-// 実効ワーカー数 = min(cfg.threads, ハードウェア並列度)。
-// threads はハードウェアより大きく設定できてしまうが、物理コアを超えた
-// ワーカーは生成コストとオーバーサブスクリプション(締め切り判定は
-// スケジュールされたときにしか走らない)で逆効果にしかならない。
-// hardware_concurrency() が 0(不明)を返す環境では設定値をそのまま使う。
+// 実効ワーカー数 = min(cfg.threads, ハードウェア並列度, cgroupのCPUクォータ)。
+// threads は利用可能CPUより大きく設定できてしまうが、実CPUを超えたワーカーは
+// 生成コストとオーバーサブスクリプション(締め切り判定はスケジュールされた
+// ときにしか走らない = thinkが予算を超過する)で逆効果にしかならない。
+// hardware_concurrency() は cgroup の CPU クォータ(cpu.max / cfs_quota)を
+// 反映しないので、クォータも直接読んで小さいほうを使う(コンテナ対策)。
+// どちらも不明な環境では設定値をそのまま使う。
 int effective_threads(const Config& cfg);
+
+// syncPct の解決(-1 = auto の実体)。Config::syncPct のコメントを参照。
+// 実効スレッド数と同じ場所で解決することで「threads>1 ⇔ syncpct 55」の対が
+// どの起動経路(ブリッジ・アリーナ・直接USI)でも外れないようにする。
+int resolved_sync_pct(const Config& cfg);
+
+// run_workers + ワーカーごとの独立PRNG。ワーカーPRNGの導出規則の定義はここ1つ:
+//   nw <= 1 … shared(通常は呼び出し側の rng_)をそのまま渡す。基準乱数も引かず、
+//             乱数の消費列を従来の逐次実装と完全に同一に保つ(A/Bの対照を守る)
+//   nw >  1 … shared から基準値を1回引き、(基準値 ^ workerId×黄金比) | 1 で
+//             ワーカーごとの独立PRNGを作って渡す(|1 は PRNG(0) =
+//             xorshiftの吸収状態を構造的に避けるため)
+void run_workers_rng(int nw, PRNG& shared, const std::function<void(int, PRNG&)>& fn);
 
 // サイトのPieceRole文字列 <-> PieceType
 PieceType role_from_site(const std::string& s);

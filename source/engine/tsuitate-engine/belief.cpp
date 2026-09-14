@@ -700,13 +700,9 @@ void Belief::force_resynthesize(const OwnView& view, TimePoint deadline) {
 	// nw==1 のときは rng_ を直接使い、乱数の消費列を従来の逐次実装と同一に保つ。
 	// 続行判定(共有カウンタ)はロックの中、synthesize 本体はロックの外。
 	{
-		const int nw = effective_threads(cfg_);
 		std::mutex mu;
 		int misses = 0;
-		const uint64_t base = nw > 1 ? rng_.rand<uint64_t>() : 0;
-		run_workers(nw, [&](int w) {
-			PRNG  local((base ^ (uint64_t(w) * 0x9e3779b97f4a7c15ull)) | 1);
-			PRNG& rng = nw > 1 ? local : rng_;
+		run_workers_rng(effective_threads(cfg_), rng_, [&](int, PRNG& rng) {
 			while (true) {
 				{
 					std::lock_guard<std::mutex> lk(mu);
@@ -720,9 +716,13 @@ void Belief::force_resynthesize(const OwnView& view, TimePoint deadline) {
 				}
 				auto p = synthesize(view, rng);
 				std::lock_guard<std::mutex> lk(mu);
-				if (p)
+				// 上限は push の時点でも検査する: 発行時の検査だけだと、飛行中の
+				// 成功が最大 threads-1 個ぶん上限を超えて積まれ、
+				// 「particles を小さくしたときに設定値を超えて作らない」という
+				// この関数の約束(冒頭コメント)が破れる。
+				if (p && parts_.size() < target)
 					parts_.push_back(std::move(p));
-				else
+				else if (!p)
 					++misses;
 			}
 		});
@@ -884,15 +884,11 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 	//   - 乱数の消費列は逐次版と揃えない(粒子の中身は並びも含めて変わる)。
 	//     threads は挙動が変わり得るフラグとして扱い、A/B は threads 同士で行うこと
 	{
-		const int nw = effective_threads(cfg_);
 		std::mutex mu;
 		int relax = 0;
 		int fails = 0;
 		int tries = 0;
-		const uint64_t base = nw > 1 ? rng_.rand<uint64_t>() : 0;
-		run_workers(nw, [&](int w) {
-			PRNG  local((base ^ (uint64_t(w) * 0x9e3779b97f4a7c15ull)) | 1);
-			PRNG& rng = nw > 1 ? local : rng_;
+		run_workers_rng(effective_threads(cfg_), rng_, [&](int, PRNG& rng) {
 			while (true) {
 				int    myRelax;
 				size_t myFails;
@@ -943,9 +939,11 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 				{
 					std::lock_guard<std::mutex> lk(mu);
 					// fails は現行レベルのジョブの結果だけで動かす(上のコメント)。
-					// nw==1 では常に myRelax == relax なので逐次版と同一。
+					// 逐次実行では常に myRelax == relax なので従来の逐次版と同一。
+					// push は want を上限に再検査する(飛行中の成功で超えない)。
 					if (p) {
-						parts_.push_back(std::move(p));
+						if (parts_.size() < want)
+							parts_.push_back(std::move(p));
 						if (myRelax == relax)
 							fails = 0;
 					} else {
@@ -965,15 +963,11 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 	// リプレイでは再現できない稀な相手の指し回しに遭遇したときの保険で、
 	// 「駒勘定と王手状態だけ合う配置」でも 0粒子(当てずっぽう)よりはるかにまし。
 	if (parts_.size() < hardMin) {
-		// 逐次・並列共通の1実装(上のラダーと同じ理屈。nw==1 は rng_ を直接使う)
+		// 逐次・並列共通の1実装(上のラダーと同じ理屈)
 		size_t synthTarget = std::max(hardMin, want / 4);
-		const int nw = effective_threads(cfg_);
 		std::mutex mu;
 		int misses = 0;
-		const uint64_t base = nw > 1 ? rng_.rand<uint64_t>() : 0;
-		run_workers(nw, [&](int w) {
-			PRNG  local((base ^ (uint64_t(w) * 0x9e3779b97f4a7c15ull)) | 1);
-			PRNG& rng = nw > 1 ? local : rng_;
+		run_workers_rng(effective_threads(cfg_), rng_, [&](int, PRNG& rng) {
 			while (true) {
 				{
 					std::lock_guard<std::mutex> lk(mu);
@@ -983,9 +977,10 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 				}
 				auto p = synthesize(view, rng);
 				std::lock_guard<std::mutex> lk(mu);
-				if (p)
+				// push 時にも上限を再検査(飛行中の成功で synthTarget を超えない)
+				if (p && parts_.size() < synthTarget)
 					parts_.push_back(std::move(p));
-				else
+				else if (!p)
 					++misses;
 			}
 		});

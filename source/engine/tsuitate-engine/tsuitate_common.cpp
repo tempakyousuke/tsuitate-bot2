@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <thread>
 
 #include "../../bitboard.h"
@@ -424,12 +426,73 @@ void run_workers(int nThreads, const std::function<void(int)>& fn) {
 		t.join();
 }
 
+namespace {
+
+// cgroup の CPU クォータ(使えるコア数相当)。読めない・無制限なら 0。
+// クォータはプロセスの生存中に変わらない前提で、初回だけ読んでキャッシュする。
+int detect_cpu_quota() {
+	// cgroup v2: /sys/fs/cgroup/cpu.max = "<quota> <period>" または "max <period>"
+	if (FILE* f = std::fopen("/sys/fs/cgroup/cpu.max", "r")) {
+		char buf[64] = {};
+		size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+		std::fclose(f);
+		if (n > 0) {
+			if (std::strncmp(buf, "max", 3) == 0)
+				return 0;  // 無制限
+			long long quota = 0, period = 0;
+			if (std::sscanf(buf, "%lld %lld", &quota, &period) == 2 && quota > 0 && period > 0)
+				return int(std::max(1ll, quota / period));
+			return 0;
+		}
+	}
+	// cgroup v1
+	auto read_ll = [](const char* path, long long& out) {
+		FILE* f = std::fopen(path, "r");
+		if (!f)
+			return false;
+		bool ok = std::fscanf(f, "%lld", &out) == 1;
+		std::fclose(f);
+		return ok;
+	};
+	long long quota = 0, period = 0;
+	if (read_ll("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", quota)
+	    && read_ll("/sys/fs/cgroup/cpu/cpu.cfs_period_us", period)
+	    && quota > 0 && period > 0)
+		return int(std::max(1ll, quota / period));
+	return 0;
+}
+
+} // namespace
+
 int effective_threads(const Config& cfg) {
 	int t = std::max(1, cfg.threads);
 	unsigned hw = std::thread::hardware_concurrency();
 	if (hw > 0)
 		t = std::min<int>(t, int(hw));
+	// hardware_concurrency は cgroup のクォータを反映しない(affinityベース)ので、
+	// クォータ制限つきコンテナではホストのコア数が返る。クォータも見て絞る。
+	static const int quota = detect_cpu_quota();
+	if (quota > 0)
+		t = std::min(t, quota);
 	return t;
+}
+
+int resolved_sync_pct(const Config& cfg) {
+	if (cfg.syncPct >= 0)
+		return cfg.syncPct;  // 明示指定
+	return effective_threads(cfg) > 1 ? 55 : 40;
+}
+
+void run_workers_rng(int nw, PRNG& shared, const std::function<void(int, PRNG&)>& fn) {
+	if (nw <= 1) {
+		fn(0, shared);
+		return;
+	}
+	const uint64_t base = shared.rand<uint64_t>();
+	run_workers(nw, [&](int w) {
+		PRNG local((base ^ (uint64_t(w) * 0x9e3779b97f4a7c15ull)) | 1);
+		fn(w, local);
+	});
 }
 
 } // namespace Tsuitate

@@ -112,14 +112,19 @@ class Engine {
 // TSUITATE_ENGINE_OPTS は一度だけパースし、「指定済みキーの判定」と「送信」の
 // 両方に同じ結果を使う(判定だけ別のregexで再実装すると、区切り規則が
 // ずれたときに明示設定を黙って上書き/自動設定を黙って欠落させる)。
+// Map は**後勝ち**: エンジンも最後に送られた `set` を採用するので、キーが
+// 重複したときの解釈を揃える(先勝ちで判定すると実際に効く値と食い違う)。
 const engineOpts = engineOptions
 	.split(',')
 	.map((s) => s.trim())
 	.filter(Boolean)
 	.map((kv) => kv.replace(/[=:]/g, ' '));
-const engineOptNames = new Set(engineOpts.map((kv) => kv.split(/\s+/)[0]));
-const engineOptValue = (name: string): string | undefined =>
-	engineOpts.find((kv) => kv.split(/\s+/)[0] === name)?.split(/\s+/)[1];
+const engineOptMap = new Map(
+	engineOpts.map((kv) => {
+		const sp = kv.split(/\s+/);
+		return [sp[0], sp.slice(1).join(' ')] as const;
+	}),
+);
 
 // 利用可能CPU数。availableParallelism() は cgroup の CPU クォータ(cpu.max /
 // cfs_quota)を反映しない(affinity ベース)ので、クォータ制限つきコンテナでは
@@ -153,22 +158,19 @@ const engine = new Engine(enginePath);
 engine.send('usi');
 
 // 既定でCPUぶんのワーカースレッドを使う(§3.1 粒子並列。4コアで実効3.8倍)。
-// threads の明示指定があればその値を尊重する(自動設定はしない)。
-let effectiveThreads: number;
-if (engineOptNames.has('threads')) {
-	effectiveThreads = Math.max(1, Number(engineOptValue('threads')) || 1);
-} else {
+// threads の明示指定があればエンジンにはその値だけを渡す。
+//
+// 実効値へのクランプ(ハードウェア並列度・cgroupクォータ)と、syncpct の
+// auto 解決(実効スレッド数>1 なら 55、そうでなければ 40 —— 探索だけ並列化
+// すると反則経済が崩れる較正知識、docs/strengthening.md 3.4章)は
+// **エンジン側**(effective_threads / resolved_sync_pct)が行う。ブリッジで
+// 判定すると「要求したスレッド数」しか見えず、エンジンのクランプで実効値が
+// 変わったときに対が外れる。エンジンは対局開始時に実効値を info 行で報告する。
+if (!engineOptMap.has('threads')) {
 	const quota = cgroupCpuQuota();
-	effectiveThreads = Math.max(1, Math.min(availableParallelism(), quota ?? Infinity, 16));
-	engine.send(`set threads ${effectiveThreads}`);
+	const n = Math.max(1, Math.min(availableParallelism(), quota ?? Infinity, 16));
+	engine.send(`set threads ${n}`);
 }
-// 並列時は思考予算の配分を信念側へ寄せる(syncpct 40 → 55)。
-// 探索だけ並列化すると攻撃性と反則コストの均衡が壊れる(120局で43.3%)が、
-// 増えた計算の一部を信念に戻すと 61.7%(z=+2.74)でゲート通過
-// (docs/strengthening.md 3.4章)。この対は「実効スレッド数 > 1」で判定する ——
-// threads を明示指定した場合にも適用しないと、並列化だけ opt-in して
-// 較正が外れた 43.3% 構成に落ちる。syncpct の明示指定があればそちらを優先。
-if (effectiveThreads > 1 && !engineOptNames.has('syncpct')) engine.send('set syncpct 55');
 for (const kv of engineOpts) engine.send(`set ${kv}`);
 
 // ---------------------------------------------------------------------------

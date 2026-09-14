@@ -30,6 +30,13 @@ struct ThinkResult {
 	int         depthReached = 0;
 	uint64_t    nodes = 0;        // 確定化探索の総ノード数(診断。nodes/sの分子)
 	TimePoint   elapsedMs = 0;
+
+	// スループット(kilo nodes / 秒 = nodes / 経過ms)。分母は信念同期込みの
+	// 思考時間全体。knps の**定義はここ1つ**: 実対局の info 行も、アリーナ診断
+	// (合計値のプール)も同じ「nodes/経過ms」で、配備とアリーナのゲート数値を
+	// そのまま突き合わせられるようにする(式が2か所に分かれて整数除算などで
+	// ずれると、スループット退行の監視という目的自体が壊れる)。
+	double knps() const { return elapsedMs > 0 ? double(nodes) / double(elapsedMs) : 0.0; }
 };
 
 class Thinker {

@@ -330,6 +330,14 @@ private:
 		core_.new_game(us, cfg_);
 		inGame_ = true;
 		sync_cout << "info string new game as " << (us == BLACK ? "sente" : "gote") << sync_endl;
+		// 実効値の可視化: threads はハードウェア並列度と cgroup クォータで
+		// クランプされ、syncpct は -1(auto)だと実効スレッド数から解決される。
+		// 設定値と実効値がずれたとき(クォータ制限コンテナ等)に黙って
+		// 未較正の組で動かないよう、確定した値をここで必ず1行出す。
+		sync_cout << "info string effective threads=" << effective_threads(cfg_)
+		          << " (set " << cfg_.threads << ")"
+		          << " syncpct=" << resolved_sync_pct(cfg_)
+		          << (cfg_.syncPct < 0 ? " (auto)" : "") << sync_endl;
 		// 設定が確定するのは対局開始時(`set` は1キーずつなので順序に依存する)。
 		// blockcp が黙って無効化されると「効かないつまみを回している」ことに
 		// 気づけないので、ここで一度だけ知らせる。アリーナは run_arena で
@@ -426,9 +434,10 @@ private:
 			          << " cp=" << int(r.expectedCp)
 			          << " depth=" << r.depthReached
 			          // nodes/knps は §3.1/§3.2 の採用ゲート指標。アリーナ診断にしか
-			          // 出さないと、配備(ブリッジ経由)でのスループット退行が見えない
+			          // 出さないと、配備(ブリッジ経由)でのスループット退行が見えない。
+			          // 式は ThinkResult::knps() に一本化(アリーナ側と同じ定義)
 			          << " nodes=" << r.nodes
-			          << " knps=" << (r.elapsedMs > 0 ? (long long) (r.nodes / (uint64_t) r.elapsedMs) : 0)
+			          << " knps=" << int(r.knps())
 			          << " time=" << r.elapsedMs << "ms" << sync_endl;
 		if (r.best == Move::none())
 			sync_cout << "bestmove resign" << sync_endl;
