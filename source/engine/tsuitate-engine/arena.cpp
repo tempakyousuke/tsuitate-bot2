@@ -59,6 +59,7 @@ struct ArenaStats {
 	// 平均が反則率で重み付いてしまう。設定間で比べる指標はすべて手番単位で取る。
 	long long turns = 0;
 	long long particleSum = 0, zeroParticle = 0;
+	double    essSum = 0;  // §2 SIR: 実効サンプル数(sir=0では粒子数と同じ)
 	// 探索スループット(§3.1/§3.2の採用ゲート用)。決定ごとに集計する。
 	long long nodesSum = 0, thinkMsSum = 0, depthSum = 0;
 	double    pLegalSum = 0;     // 整数%で持つと二重に切り捨てて0.5pp沈むのでdoubleで持つ
@@ -81,6 +82,7 @@ struct ArenaStats {
 	void add_turn(const ThinkResult& r) {
 		turns++;
 		particleSum += r.nParticles;
+		essSum += r.ess;
 		pLegalSum += r.pLegal;
 		if (r.nParticles == 0)
 			zeroParticle++;
@@ -477,6 +479,9 @@ void run_arena(const ArenaOptions& opt) {
 		std::cout << "  belief diag[" << (k == 0 ? opt.p1 : opt.p2) << "#" << (k + 1) << "]:"
 		          << " turns=" << g.turns << " decisions=" << g.decisions
 		          << " avg_particles=" << (double(g.particleSum) / T)
+		          // §2 SIR の縮退診断。ESS は再生成で人口が回復する**前**に測るので、
+		          // sir=0 でも avg_particles(think後の粒子数)より低く出うる
+		          << " avg_ess=" << (g.essSum / T)
 		          << " relax(0/1/2/synth)=" << g.relaxHist[0] << "/" << g.relaxHist[1]
 		          << "/" << g.relaxHist[2] << "/" << g.relaxHist[3]
 		          << " zero_particle=" << g.zeroParticle

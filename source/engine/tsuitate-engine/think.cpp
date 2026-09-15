@@ -125,6 +125,7 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	belief.sync(hist, view, t0 + budgetMs * syncPct / 100);
 	res.nParticles = belief.size();
 	res.relaxLevel = belief.relaxLevel();
+	res.ess        = belief.ess();
 
 	// 2) 候補手(この手番で反則になった手は除外)
 	std::vector<Move> cands;
@@ -164,6 +165,12 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	};
 	scan_legality();
 
+	// §2 SIR: 粒子の正規化重み(合計 = 粒子数)。sir=0 では全要素1.0で、
+	// 以下の重み付き式(p_legal・pick_particles)は従来の等重み式と厳密に一致する。
+	// 粒子集合が入れ替わったら(破産処理後)必ず取り直すこと。
+	std::vector<double> wts;
+	belief.normalized_weights(wts);
+
 	// 信念の破産検出: 全候補が全粒子で不正 = 信念が確実に間違っている
 	// (真の局面に合法手がなければサーバーが終局させているはず)。
 	// 粒子を捨てて合成粒子で作り直す。ここで反則を重ねても情報はゼロ
@@ -188,6 +195,7 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 			if (belief.particles().empty())
 				return heuristic_pick();
 			scan_legality();
+			belief.normalized_weights(wts);
 		}
 	}
 	const size_t NP = belief.particles().size() ? belief.particles().size() : 1;
@@ -218,7 +226,16 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	const double prA = cfg.pLegalPrior * cfg.pLegalPriorMean;
 	const double prB = cfg.pLegalPrior * (1.0 - cfg.pLegalPriorMean);
 	auto p_legal = [&](size_t i) {
-		return (double(legalIdx[i].size()) + prA) / (double(NP) + prA + prB);
+		// §2 SIR: 重み付き合法率。等重み(sir=0)では mass = 粒子数なので従来と同一。
+		double mass;
+		if (cfg.sir) {
+			mass = 0.0;
+			for (uint32_t j : legalIdx[i])
+				mass += wts[j];
+		} else {
+			mass = double(legalIdx[i].size());
+		}
+		return (mass + prA) / (double(NP) + prA + prB);
 	};
 
 	// 反則コスト(centipawn)。累計10回で反則負けなので、残り予算が減るほど急騰させる。
@@ -345,12 +362,34 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		return pl * (meanCp + blockBonus[i]) + (1.0 - pl) * foulCp;
 	};
 
-	// 均等間隔で粒子を選ぶ(粒子は生成順に相関があるため)
+	// 均等間隔で粒子を選ぶ(粒子は生成順に相関があるため)。
+	// §2 SIR では重みに比例した系統抽出になる: 選ばれた粒子の等重み平均が
+	// 重み付き期待値の近似になるので、評価ループ側は変更なしで済む。
+	// 重い粒子は複数回選ばれうる(それが正しい重み付け)。sir=0 の経路は従来と同一。
 	auto pick_particles = [&](const std::vector<uint32_t>& idx, size_t k) {
 		std::vector<uint32_t> out;
 		if (idx.empty())
 			return out;
 		k = std::min(k, idx.size());
+		if (cfg.sir) {
+			double total = 0;
+			for (uint32_t j : idx)
+				total += wts[j];
+			if (total > 0) {
+				size_t i = 0;
+				double cum = wts[idx[0]];
+				for (size_t t = 0; t < k; ++t) {
+					const double pos = (double(t) + 0.5) / double(k) * total;
+					while (cum < pos && i + 1 < idx.size()) {
+						++i;
+						cum += wts[idx[i]];
+					}
+					out.push_back(idx[i]);
+				}
+				return out;
+			}
+			// total==0 は正規化の作りからありえないが、0除算だけは構造的に防ぐ
+		}
 		for (size_t t = 0; t < k; ++t)
 			out.push_back(idx[t * idx.size() / k]);
 		return out;

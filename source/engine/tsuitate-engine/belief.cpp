@@ -25,6 +25,7 @@ void Belief::reset(Color us, const Config& cfg) {
 	curFouls_.clear();
 	for (int i = 0; i < cfg_.particles; ++i)
 		parts_.push_back(std::make_unique<Particle>());
+	essLast_ = double(parts_.size());
 }
 
 double Belief::relax_mean() const {
@@ -98,6 +99,75 @@ bool Belief::opp_move_consistent(const Particle& p, const HistEvent& ev, Move m,
 	return true;
 }
 
+// --- §2 SIR: 相手イベントの尤度 --------------------------------------------
+//
+// どちらの尤度も非千里眼prior(fast_policy_score)の softmax+ε一様で重み付ける。
+// oppPolicy=0(千里眼評価softmax)のときも prior を使う: 尤度は全粒子×全手で
+// 回るので評価関数呼び出しは高すぎるし、SIR が使いたい生成モデルは
+// 「相手は自分の駒だけで手を選ぶ」のほう(探索の相手ノード・信念の方策と同じ)。
+
+// P(相手の反則 | 粒子) = 1 − p_ok。
+// p_ok は「相手の意図(相手視界での指したい手)のうち粒子上で合法な質量」で、
+// dsearch::opp_node が期待反則回数に使うのと同じ量・同じ重み付け。
+double Belief::opp_foul_likelihood(const Particle& p) const {
+	const Color opp = ~us_;
+	// 粒子は相手の手番(自分の着手を適用済み)なので、in_check() は相手側の状態
+	std::vector<OppIntent> intents;
+	enumerate_opp_intents(p.pos, opp, intents, p.pos.in_check(), cfg_);
+	const size_t n = intents.size();
+	if (n == 0)
+		return 1.0;  // 意図が1つもない(実質ありえない)。証拠なしとして中立
+	double mx = -1e18;
+	for (const auto& it : intents)
+		mx = std::max(mx, double(it.score));
+	std::vector<double> w(n);
+	double sum = 0;
+	for (size_t i = 0; i < n; ++i) {
+		w[i] = std::exp((double(intents[i].score) - mx) / cfg_.policyTemp);
+		sum += w[i];
+	}
+	double pOk = 0;
+	for (size_t i = 0; i < n; ++i) {
+		double q = (1.0 - cfg_.policyEps) * (w[i] / sum) + cfg_.policyEps / double(n);
+		if (p.legal(intents[i].m))
+			pOk += q;
+	}
+	// 相手は試行済みの手を除いて指し直すが、復元抽出の近似で足りる(§1と同じ)
+	return 1.0 - pOk;
+}
+
+// P(観測と整合する着手 | 粒子) = 粒子の合法手の方策質量のうち整合手が占める割合。
+// consistent は consistent_opp_moves の出力(粒子の合法手の部分集合)。
+double Belief::opp_move_likelihood(const Particle& p, const std::vector<Move>& consistent) const {
+	const Color opp     = ~us_;
+	const bool  inCheck = p.pos.in_check();
+	std::vector<Move>   all;
+	std::vector<double> sc;
+	double mx = -1e18;
+	for (auto ext : MoveList<LEGAL_ALL>(p.pos)) {
+		Move m = ext;
+		all.push_back(m);
+		double s = double(fast_policy_score(p.pos, opp, m, inCheck, cfg_));
+		sc.push_back(s);
+		mx = std::max(mx, s);
+	}
+	const size_t n = all.size();
+	if (n == 0)
+		return 1.0;  // 合法手なし(呼び出し前の整合フィルタで死んでいるはず)
+	double sum = 0;
+	for (auto& s : sc) {
+		s = std::exp((s - mx) / cfg_.policyTemp);
+		sum += s;
+	}
+	double mass = 0;
+	for (size_t i = 0; i < n; ++i) {
+		double q = (1.0 - cfg_.policyEps) * (sc[i] / sum) + cfg_.policyEps / double(n);
+		if (std::find(consistent.begin(), consistent.end(), all[i]) != consistent.end())
+			mass += q;
+	}
+	return mass;
+}
+
 // 方策 = softmax(スコア / 温度) + ε一様。excludeの手は候補から外す。
 Move Belief::sample_policy(Particle& p, const std::vector<Move>& moves,
                            const std::vector<Move>& exclude, PRNG& rng) {
@@ -150,6 +220,7 @@ Move Belief::sample_policy(Particle& p, const std::vector<Move>& moves,
 ParticlePtr Belief::clone_of(const GameHistory& hist, const Particle& src) {
 	auto p = std::make_unique<Particle>();
 	p->relax = src.relax;
+	p->logw  = src.logw;  // §2 SIR: 複製は親の観測重みを引き継ぐ
 	size_t k = 0;
 	for (size_t i = 0; i < cursor_; ++i) {
 		const HistEvent& ev = hist.events[i];
@@ -212,7 +283,14 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 	}
 
 	case EvKind::OppFoul:
-		// 相手の反則は真の局面に制約を与えない
+		// 相手の反則は真の局面に制約を与えない(等重みではカウントのみ)。
+		// §2 SIR: ただし「相手の意図した手が真の盤で不正だった」という観測なので、
+		// 相手の駒配置(=粒子)によって起こりやすさが違う弱い証拠になる。
+		// 尤度の床(0.02)は、prior が粗い量である以上「この粒子ではありえない」と
+		// 言い切らないための保険(棄却ではなく減点に留める)。
+		if (cfg_.sir)
+			for (auto& p : parts_)
+				p->logw += std::log(std::max(0.02, opp_foul_likelihood(*p)));
 		break;
 
 	case EvKind::OppMove: {
@@ -235,6 +313,14 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 			pd.moves = buf;
 			pend.push_back(std::move(pd));
 		}
+
+		// §2 SIR: 着手の観測(取られたマス・王手宣言)の尤度 = 整合手の方策質量。
+		// 「相手が詰まりやすい配置」「観測と偶然しか整合しない配置」の粒子を
+		// 確率的なまま減点する(棄却は従来どおり整合手ゼロのときだけ)。
+		// 床(0.02)は OppFoul 側と同じ理由の保険。
+		if (cfg_.sir)
+			for (auto& pd : pend)
+				pd.p->logw += std::log(std::max(0.02, opp_move_likelihood(*pd.p, pd.moves)));
 
 		// 2) 各親の着手をサンプリング
 		for (auto& pd : pend)
@@ -277,6 +363,99 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 		break;
 	}
 	}
+}
+
+// §2 SIR: 正規化した重み(合計 = 粒子数)。sir=0 や logw が全て0なら全要素1.0で、
+// think() 側の重み付き式は従来の等重み式と厳密に一致する。
+void Belief::normalized_weights(std::vector<double>& out) const {
+	const size_t n = parts_.size();
+	out.assign(n, 1.0);
+	if (!cfg_.sir || n == 0)
+		return;
+	double mx = -1e18;
+	for (const auto& p : parts_)
+		mx = std::max(mx, p->logw);
+	double sum = 0;
+	for (size_t i = 0; i < n; ++i) {
+		out[i] = std::exp(parts_[i]->logw - mx);
+		sum += out[i];
+	}
+	const double scale = double(n) / sum;
+	for (auto& v : out)
+		v *= scale;
+}
+
+// §2 SIR: 重みの正規化(平均→1)・ESS計測・縮退時の系統的リサンプリング。
+// sync のイベント適用が終わった直後に1回だけ呼ぶ(clone_of が cursor_ に依存する
+// ので、イベント適用の途中でリサンプリングすると末尾の相手手が複製から落ちる)。
+// 正規化を毎sync行うので、以後に入る新粒子(logw=0)はちょうど平均重みで入る。
+void Belief::weights_normalize_and_resample(const GameHistory& hist) {
+	const size_t n = parts_.size();
+	if (n == 0) {
+		essLast_ = 0;
+		return;
+	}
+	double mx = -1e18;
+	for (const auto& p : parts_)
+		mx = std::max(mx, p->logw);
+	std::vector<double> w(n);
+	double sum = 0, sum2 = 0;
+	for (size_t i = 0; i < n; ++i) {
+		w[i] = std::exp(parts_[i]->logw - mx);
+		sum += w[i];
+		sum2 += w[i] * w[i];
+	}
+	essLast_ = sum * sum / sum2;
+
+	if (essLast_ >= double(n) * 0.5) {
+		// 縮退していない: 平均→1 へ正規化するだけ(重み情報は保持)
+		const double shift = mx + std::log(sum / double(n));
+		for (auto& p : parts_)
+			p->logw -= shift;
+		return;
+	}
+
+	// 系統的リサンプリング: 累積重みを等間隔(オフセットは乱数1回)で刺す。
+	// 重い粒子ほど多く複製され、複製は独立の実体にする(以後の相手手サンプリングで
+	// 分岐して多様性が戻る)。複製の1つ目は元の粒子をそのまま使い、2つ目以降は
+	//   - リプレイ粒子: clone_of(履歴リプレイ。oppMoves列は cursor_ と整合済み)
+	//   - 合成粒子:     SFEN経由の複製(履歴を持たないので clone_of は使えない)
+	// で作る。リサンプリング後は等重みに戻す(標準的なSIRのとおり)。
+	std::vector<uint32_t> copies(n, 0);
+	const double u = double(rng_.rand<uint64_t>() >> 11) / double(1ull << 53);
+	{
+		size_t i = 0;
+		double cum = w[0];
+		for (size_t t = 0; t < n; ++t) {
+			const double pos = (double(t) + u) / double(n) * sum;
+			while (cum < pos && i + 1 < n) {
+				++i;
+				cum += w[i];
+			}
+			copies[i]++;
+		}
+	}
+	std::vector<ParticlePtr> next;
+	next.reserve(n);
+	for (size_t i = 0; i < n; ++i) {
+		if (copies[i] == 0)
+			continue;
+		for (uint32_t c = 1; c < copies[i]; ++c) {
+			ParticlePtr dup;
+			if (parts_[i]->synthetic) {
+				dup = std::make_unique<Particle>();
+				if (!dup->init_from_sfen(parts_[i]->pos.sfen()))
+					continue;  // 自前で組んだSFENなので失敗しないはずだが、保険
+			} else {
+				dup = clone_of(hist, *parts_[i]);
+			}
+			next.push_back(std::move(dup));
+		}
+		next.push_back(std::move(parts_[i]));
+	}
+	parts_ = std::move(next);
+	for (auto& p : parts_)
+		p->logw = 0.0;
 }
 
 namespace {
@@ -706,6 +885,7 @@ void Belief::force_resynthesize(const OwnView& view, TimePoint deadline) {
 	});
 	relaxMean_  = relax_mean();
 	relaxLevel_ = int(relaxMean_ + 0.5);
+	essLast_    = double(parts_.size());  // 作り直し = 等重み(logwは全粒子0)
 }
 
 // 合成粒子で target まで埋める(逐次・並列共通の1実装。sync の最終フォールバックと
@@ -833,6 +1013,13 @@ void Belief::sync(const GameHistory& hist, const OwnView& view, TimePoint deadli
 		apply_event(hist, ev);
 		++cursor_;
 	}
+
+	// §2 SIR: 観測を効かせた重みの後始末(正規化・ESS計測・縮退時のリサンプリング)。
+	// ESS は再生成で人口が回復する前に測る(縮退の診断として意味があるのはここ)。
+	if (cfg_.sir)
+		weights_normalize_and_resample(hist);
+	else
+		essLast_ = double(parts_.size());
 
 	// 再生成(枯渇・不足時)。
 	// 緩和(relax>0)した粒子は観測と部分的に矛盾していて合法率の推定を汚すので、

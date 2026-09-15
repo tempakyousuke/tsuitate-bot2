@@ -148,6 +148,8 @@ bool set_config_key(Config& c, const std::string& key, const std::string& val) {
 	else if (key == "threads")      apply_i(c.threads, 0, 64);
 	// 置換表 + killer/history オーダリング(§3.2)。0で従来どおり。
 	else if (key == "tt")           apply_i(c.tt, 0, 1);
+	// 重み付き粒子フィルタ(§2 SIR)。0で従来どおり(等重み)。
+	else if (key == "sir")          apply_i(c.sir, 0, 1);
 	else if (key == "regenfloor")   apply_i(c.regenFloorPct, 0, 100);
 	else if (key == "loglevel")     apply_i(c.logLevel, 0, 2);
 	else if (key == "policytemp")   apply_d(c.policyTemp, 1.0, 100000.0);
