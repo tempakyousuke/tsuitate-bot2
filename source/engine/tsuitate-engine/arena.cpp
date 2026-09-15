@@ -610,7 +610,8 @@ void run_arena(const ArenaOptions& opt) {
 			std::cout << "-";
 		// 予算の内訳(決定あたり平均ms)。sync が締め切りいっぱいまで使うと
 		// stage2 に残る時間が構造的に決まる
-		std::cout << " ms(sync/s1/s2)=" << (double(g.syncMsSum) / double(g.decisions))
+		std::cout << " bad_advance=" << bad_advance_count()
+		          << " ms(sync/s1/s2)=" << (double(g.syncMsSum) / double(g.decisions))
 		          << "/" << (double(g.stage1MsSum) / double(g.decisions))
 		          << "/" << (double(g.stage2MsSum) / double(g.decisions))
 		          // 候補数と stage1 の1候補あたり粒子数(stage1pct の効き方を見る)

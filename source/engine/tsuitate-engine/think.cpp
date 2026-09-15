@@ -335,6 +335,15 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		ds.us         = view.us;
 		ds.foulGain   = foulGain;
 		ds.ctx        = sctx;
+		// 保険: legalIdx で合法な粒子だけが来るはずだが、不正な手を do_move に
+		// 渡すと segfault する(9.5章)。ここで弾いて記録し、値は静的評価で代用する
+		if (!(pos.pseudo_legal_s<true>(m) && pos.legal(m))) {
+			static std::atomic<int> reported{0};
+			if (reported.fetch_add(1) < 20)
+				fprintf(stderr, "tsuitate: BAD JOB move=%s depth=%d sfen=%s\n",
+				        to_usi_string(m).c_str(), depth, pos.sfen().c_str());
+			return squash_cp(Value(0));
+		}
 		pos.do_move(m, st);
 		Value v;
 		if (depth == 0) {

@@ -60,10 +60,22 @@ struct Particle {
 		return !pos.set(sfen, &sts.back()).has_value();
 	}
 
-	void advance(Move m) {
+	// 手を進める。**適用前に合法性を確かめる**: 呼び出し側は全経路で合法性を
+	// 検査してから呼ぶ設計だが、アリーナの長時間実行で「移動元が空の手を
+	// do_move に渡して segfault」が稀に(〜0.5%/局)起きている(docs/strengthening.md
+	// 9.5章)。不正なら適用せず false を返し、粒子を死んだものとして扱わせる。
+	// 検査は pseudo_legal + legal で、リプレイ1手あたり数µs(全体の数%)。
+	bool advance(Move m) {
+		if (!legal(m)) {
+			report_bad_advance(m);
+			return false;
+		}
 		sts.emplace_back();
 		pos.do_move(m, sts.back());
+		return true;
 	}
+	// 不正な advance を stderr に記録する(どの粒子・どの手か。原因調査用)。
+	void report_bad_advance(Move m) const;
 
 	// この粒子上でmが(通常将棋ルールで)合法か
 	bool legal(Move m) const {
@@ -72,6 +84,9 @@ struct Particle {
 };
 
 using ParticlePtr = std::unique_ptr<Particle>;
+
+// 不正な advance(合法性検査で弾いた手)のプロセス全体の回数。診断用
+long long bad_advance_count();
 
 class Belief {
 public:

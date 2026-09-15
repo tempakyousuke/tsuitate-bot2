@@ -4,7 +4,9 @@
 #if defined(TSUITATE_ENGINE)
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <mutex>
 
 #include "../../movegen.h"
@@ -12,6 +14,19 @@
 
 namespace YaneuraOu {
 namespace Tsuitate {
+
+// 不正な advance の回数(プロセス全体)。stderr の記録は最初の 20 回だけ出す
+// (大量に出ても原因調査には役立たず、アリーナの出力を埋めるだけ)。
+static std::atomic<long long> g_badAdvance{0};
+long long bad_advance_count() { return g_badAdvance.load(); }
+
+void Particle::report_bad_advance(Move m) const {
+	const long long n = ++g_badAdvance;
+	if (n <= 20)
+		fprintf(stderr, "tsuitate: BAD ADVANCE #%lld move=%s synthetic=%d relax=%d oppMoves=%zu sfen=%s\n",
+		        n, to_usi_string(m).c_str(), int(synthetic), relax, oppMoves.size(),
+		        pos.sfen().c_str());
+}
 
 void Belief::reset(Color us, const Config& cfg) {
 	us_  = us;
@@ -225,11 +240,20 @@ ParticlePtr Belief::clone_of(const GameHistory& hist, const Particle& src) {
 	for (size_t i = 0; i < cursor_; ++i) {
 		const HistEvent& ev = hist.events[i];
 		if (ev.kind == EvKind::OurMove) {
-			p->advance(ev.move);
+			if (!p->advance(ev.move))
+				return nullptr;
 		} else if (ev.kind == EvKind::OppMove) {
+			// 親の oppMoves 列は cursor_ までの OppMove イベント数と一致しているはず。
+			// 足りなければ複製を諦める(範囲外を読んで不正な手を進めない)
+			if (k >= src.oppMoves.size()) {
+				fprintf(stderr, "tsuitate: clone_of: oppMoves too short (%zu) at event %zu/%zu\n",
+				        src.oppMoves.size(), i, cursor_);
+				return nullptr;
+			}
 			Move m = src.oppMoves[k++];
 			p->oppMoves.push_back(m);
-			p->advance(m);
+			if (!p->advance(m))
+				return nullptr;
 		}
 	}
 	return p;
@@ -257,11 +281,10 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 				bool gc = p->pos.gives_check(ev.move);
 				ok = gc == (ev.check == CheckAfter::Yes);
 			}
-			if (!ok) {
+			if (!ok || !p->advance(ev.move)) {
 				bury(*p);
 				continue;
 			}
-			p->advance(ev.move);
 			alive.push_back(std::move(p));
 		}
 		parts_ = std::move(alive);
@@ -340,9 +363,11 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 				Move alt = sample_policy(*pd.p, pd.moves, excl, rng_);
 				if (alt != Move::none()) {
 					auto child = clone_of(hist, *pd.p);
-					child->oppMoves.push_back(alt);
-					child->advance(alt);
-					next.push_back(std::move(child));
+					if (child) {
+						child->oppMoves.push_back(alt);
+						if (child->advance(alt))
+							next.push_back(std::move(child));
+					}
 					--budget;
 				} else {
 					// 代替手がない親はスキップ
@@ -356,8 +381,10 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 		// 4) 親を進める
 		for (auto& pd : pend) {
 			pd.p->oppMoves.push_back(pd.chosen);
-			pd.p->advance(pd.chosen);
-			next.push_back(std::move(pd.p));
+			if (pd.p->advance(pd.chosen))
+				next.push_back(std::move(pd.p));
+			else
+				bury(*pd.p);
 		}
 		parts_ = std::move(next);
 		break;
@@ -448,6 +475,8 @@ void Belief::weights_normalize_and_resample(const GameHistory& hist) {
 					continue;  // 自前で組んだSFENなので失敗しないはずだが、保険
 			} else {
 				dup = clone_of(hist, *parts_[i]);
+				if (!dup)
+					continue;  // 親の履歴が複製できない(不整合の記録は clone_of が出す)
 			}
 			next.push_back(std::move(dup));
 		}
@@ -953,7 +982,8 @@ ParticlePtr Belief::replay_one(const GameHistory& hist, int relax, PRNG& rng,
 						return nullptr;
 				}
 			}
-			p->advance(ev.move);
+			if (!p->advance(ev.move))
+				return nullptr;
 			break;
 		}
 		case EvKind::OurFoul:
@@ -983,7 +1013,8 @@ ParticlePtr Belief::replay_one(const GameHistory& hist, int relax, PRNG& rng,
 			if (m == Move::none())
 				return nullptr;
 			p->oppMoves.push_back(m);
-			p->advance(m);
+			if (!p->advance(m))
+				return nullptr;
 			break;
 		}
 		}
