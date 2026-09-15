@@ -143,6 +143,12 @@ private:
 	// rng は replay_one と同じ理由で引数(並列時はワーカーの PRNG)。
 	ParticlePtr synthesize(const OwnView& view, PRNG& rng);
 
+	// 合成粒子で target まで埋める(逐次・並列共通。sync の最終フォールバックと
+	// force_resynthesize で共有)。keepGoing(粒子数, ミス数) はロック内で
+	// 評価される継続判定。push は target を上限に再検査する。
+	void synth_fill(const OwnView& view, size_t target,
+	                const std::function<bool(size_t, int)>& keepGoing);
+
 	Color                    us_ = BLACK;
 	Config                   cfg_;
 	PRNG                     rng_{20260827};

@@ -257,7 +257,7 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		// run_workers の join が順序づけるので、素の比較で足りる(競合しない)。
 		if (c->stamp != thinkStamp_) {
 			c->stamp = thinkStamp_;
-			c->begin_think();
+			c->begin_think(view.oppFouls);
 		}
 		return c;
 	};

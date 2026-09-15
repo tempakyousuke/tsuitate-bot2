@@ -19,9 +19,8 @@
  */
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
-import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { availableParallelism } from 'node:os';
 import { createInterface } from 'node:readline';
 import { io, type Socket } from 'socket.io-client';
 
@@ -110,68 +109,38 @@ class Engine {
 }
 
 // TSUITATE_ENGINE_OPTS は一度だけパースし、「指定済みキーの判定」と「送信」の
-// 両方に同じ結果を使う(判定だけ別のregexで再実装すると、区切り規則が
+// 両方に**同じ Map** を使う(判定だけ別のregexで再実装すると、区切り規則が
 // ずれたときに明示設定を黙って上書き/自動設定を黙って欠落させる)。
 // Map は**後勝ち**: エンジンも最後に送られた `set` を採用するので、キーが
-// 重複したときの解釈を揃える(先勝ちで判定すると実際に効く値と食い違う)。
-const engineOpts = engineOptions
-	.split(',')
-	.map((s) => s.trim())
-	.filter(Boolean)
-	.map((kv) => kv.replace(/[=:]/g, ' '));
-const engineOptMap = new Map(
-	engineOpts.map((kv) => {
-		const sp = kv.split(/\s+/);
-		return [sp[0], sp.slice(1).join(' ')] as const;
-	}),
-);
-
-// 利用可能CPU数。availableParallelism() は cgroup の CPU クォータ(cpu.max /
-// cfs_quota)を反映しない(affinity ベース)ので、クォータ制限つきコンテナでは
-// ホストのコア数を返してしまう。クォータも読んで小さいほうを使う。
-// クォータでコア数を絞ったコンテナで過剰にスレッドを立てると、締め切り判定が
-// スケジュールされたときにしか走らず think が予算を超過する。
-function cgroupCpuQuota(): number | null {
-	try {
-		// cgroup v2: "<quota> <period>" または "max <period>"
-		const m = readFileSync('/sys/fs/cgroup/cpu.max', 'utf8').trim().split(/\s+/);
-		if (m[0] !== 'max') {
-			const quota = Number(m[0]);
-			const period = Number(m[1] ?? 100000);
-			if (quota > 0 && period > 0) return Math.max(1, Math.floor(quota / period));
-		}
-		return null;
-	} catch {
-		/* v2 でない・読めない → v1 を試す */
+// 重複したときの解釈を揃える。エンジンのキーはすべて「キー + 値1つ」なので、
+// トークンが2つでないエントリはカンマ漏れの可能性が高い —— 黙って一部だけ
+// 適用される(エンジン側も行ごと拒否する)ので、ここでも起動時に警告する。
+const engineOptMap = new Map<string, string>();
+for (const raw of engineOptions.split(',')) {
+	const kv = raw.trim().replace(/[=:]/g, ' ');
+	if (!kv) continue;
+	const sp = kv.split(/\s+/);
+	if (sp.length !== 2) {
+		console.error(
+			`TSUITATE_ENGINE_OPTS のエントリ "${raw.trim()}" は「キー 値」の形ではありません` +
+				'(カンマ区切りの漏れ?)。エンジンにはそのまま送りますが、拒否されます。',
+		);
 	}
-	try {
-		const q = Number(readFileSync('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'utf8'));
-		const p = Number(readFileSync('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'utf8'));
-		if (q > 0 && p > 0) return Math.max(1, Math.floor(q / p));
-	} catch {
-		/* 読めなければクォータなし扱い */
-	}
-	return null;
+	engineOptMap.set(sp[0], sp.slice(1).join(' '));
 }
 
 const engine = new Engine(enginePath);
 engine.send('usi');
 
 // 既定でCPUぶんのワーカースレッドを使う(§3.1 粒子並列。4コアで実効3.8倍)。
-// threads の明示指定があればエンジンにはその値だけを渡す。
-//
-// 実効値へのクランプ(ハードウェア並列度・cgroupクォータ)と、syncpct の
-// auto 解決(実効スレッド数>1 なら 55、そうでなければ 40 —— 探索だけ並列化
-// すると反則経済が崩れる較正知識、docs/strengthening.md 3.4章)は
-// **エンジン側**(effective_threads / resolved_sync_pct)が行う。ブリッジで
-// 判定すると「要求したスレッド数」しか見えず、エンジンのクランプで実効値が
-// 変わったときに対が外れる。エンジンは対局開始時に実効値を info 行で報告する。
-if (!engineOptMap.has('threads')) {
-	const quota = cgroupCpuQuota();
-	const n = Math.max(1, Math.min(availableParallelism(), quota ?? Infinity, 16));
-	engine.send(`set threads ${n}`);
-}
-for (const kv of engineOpts) engine.send(`set ${kv}`);
+// `threads 0` = auto で、使えるCPU数の判定(ハードウェア並列度・cgroupクォータ・
+// 上限16)は**エンジン側**の effective_threads がすべて行う。ブリッジで数えると
+// 同じ cgroup 検出を2言語で持つことになり、修正が必ず片方に取り残される。
+// syncpct の auto 解決(実効スレッド数>1 なら 55 —— 探索だけ並列化すると
+// 反則経済が崩れる較正知識、docs/strengthening.md 3.4章)も同様にエンジン側。
+// エンジンは対局開始時に実効値を info 行で報告する。
+if (!engineOptMap.has('threads')) engine.send('set threads 0');
+for (const [k, v] of engineOptMap) engine.send(`set ${k} ${v}`.trimEnd());
 
 // ---------------------------------------------------------------------------
 // Socket.IO 接続と対局ループ

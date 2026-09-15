@@ -368,6 +368,13 @@ void run_arena(const ArenaOptions& opt) {
 			          << " は粒子数 " << want << " では下限 " << hardMin
 			          << " 個(=" << (100 * hardMin / (want ? want : 1))
 			          << "%)に床上げされます" << std::endl;
+		// 並列なのに信念への予算配分が明示指定で低い組は実測43.3%の未較正構成
+		// (3.4章)。意図的なA/B(まさにその測定)でも使うので挙動は変えないが、
+		// 気づかず踏んでいるケースのために注記は出す(実対局の new と同じ条件)。
+		if (effective_threads(c) > 1 && c.syncPct >= 0 && c.syncPct < 50)
+			std::cout << "info string note: p" << (k + 1) << " threads>1 で syncpct="
+			          << c.syncPct << " は未較正の組です(並列時の較正値は55。"
+			          << "docs/strengthening.md 3.4章)" << std::endl;
 		// blockcp が黙って無効化される/二重に効くと「効かないつまみをスイープして
 		// いる」ことに気づけない(A/Bが丸ごと無意味になる)。
 		// 条件は think.cpp の oppNodeCountsFouls と厳密に揃えること。

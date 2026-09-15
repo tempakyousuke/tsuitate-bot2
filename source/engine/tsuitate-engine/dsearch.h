@@ -13,6 +13,8 @@
 
 #if defined(TSUITATE_ENGINE)
 
+#include <algorithm>
+
 namespace YaneuraOu {
 namespace Tsuitate {
 
@@ -24,16 +26,15 @@ namespace Tsuitate {
 // 反復深化(stage2 の d=2,4,6…)は同じ部分木を深さを変えて読み直すので、
 // 前のパスの結果が置換表に残っていると枝刈りとオーダリングが大きく効く。
 //
-// 世代(gen)は think() の呼び出しごとに進める。値による枝刈り(カットオフ)は
-// **同世代のエントリだけ**に許す: 局面評価は手番内では純粋に (局面, 深さ) の
-// 関数だが、手番をまたぐと oppFouls に依存する項(foulGain)が変わりうるため。
-// 旧世代のエントリは指し手のオーダリングにだけ使う(こちらは値が古くても無害)。
-//
-// gen は uint16: uint8 だと think() 256回(反則のやり直しも1回と数えるので
-// 1局内でも到達しうる)で一巡し、256世代前のエントリが「同世代」に化けて
-// 別の foulGain / 別の対局で計算した値がカットオフに使われる。uint16 の一巡には
-// 1局で65536回の決定が要り、さらに対局開始(new_game)でコンテキストごと
-// 破棄されるので、実質到達不能。
+// 値カットオフのゲートは**保存時の oppFouls と現在の oppFouls の一致**で行う。
+// 当初は「同世代(=同じthink)のみ」で代理していたが、それは真の不変条件
+// (foulGain = oppFouls の関数、が変わっていないこと)より遥かに強すぎる:
+// 自分の反則のやり直し(同一局面・oppFouls不変 = TT再利用の理想形)でも
+// 手番が変わるたびでも、まだ有効な値を全部捨てていた。oppFouls を
+// エントリに保存して一致を要求すれば、必要十分のゲートになる
+// (us と cfg は対局内で不変、コンテキストは対局開始で破棄、
+//  相手ノードは TT を通らないので ply 依存の反則項は混入しない)。
+// gen は置換の老化(同一thinkのエントリを深さ優先で守る)にだけ使う。
 //
 // 既知のトレードオフ(tt > 0 かつ threads > 1 のとき): TT/history はワーカー
 // ローカルで、粒子グループ→ワーカーの割当は atomic カウンタの動的スケジュール
@@ -46,8 +47,9 @@ struct TTEntry {
 	int16_t  value = 0;  // value_to_tt 済み(詰みはply補正済み)
 	uint16_t move16 = 0; // 最善手(Move::raw()。オーダリング用)
 	int8_t   depth = -1;
-	Bound    bound = BOUND_NONE;  // types.h の共通enum(独自enumで数値をずらさない)
-	uint16_t gen   = 0;
+	Bound    bound = BOUND_NONE;   // types.h の共通enum(独自enumで数値をずらさない)
+	uint8_t  oppFouls = 0;         // 保存時の相手反則累計(値カットオフのゲート。0..10)
+	uint8_t  gen   = 0;            // 置換の老化用(一巡しても値の正しさには関わらない)
 };
 static_assert(sizeof(TTEntry) == 16, "TTEntry should stay 16 bytes");
 
@@ -61,7 +63,10 @@ struct SearchContext {
 	// すると (候補,粒子) ジョブごとの構築で毎回 ~2KB のゼロ初期化が走り、
 	// killer を一度も読まない既定(tt 0)経路まで恒常コストを払うことになる。
 	Move     killer[MAX_PLY][2];
-	uint16_t gen   = 0;
+	uint8_t  gen   = 0;
+	// 現在の相手反則累計(think() 開始時に begin_think へ渡される)。
+	// 値カットオフは tte->oppFouls == curOppFouls のエントリにだけ許す。
+	uint8_t  curOppFouls = 0;
 	// この think() でもう begin_think 済みかの判定(Thinker が通し番号を発行)。
 	// コンテキストは1リージョン内では担当ワーカーだけが触り、リージョン間は
 	// run_workers の join が順序づけるので、単純な比較で足りる。
@@ -71,9 +76,11 @@ struct SearchContext {
 	//   - 初回は割り当て(16MB)をここで行う: 呼び出しスレッドで全ワーカー分を
 	//     まとめて確保すると、初手の予算内で workers×16MB のゼロ初期化と
 	//     first-touch が直列に走ってしまう。ワーカー自身にやらせて分散する
-	//   - 2回目以降は世代を進めて前手番の値カットオフを無効化し、history は
-	//     半減させる(減衰なしだと長い対局で飽和して序列の分解能が落ちる)
-	void begin_think() {
+	//   - 2回目以降は置換老化用の世代を進め、history は半減させる
+	//     (減衰なしだと長い対局で飽和して序列の分解能が落ちる)
+	// oppFouls: 現在の相手反則累計(値カットオフのゲートに使う)
+	void begin_think(int oppFouls) {
+		curOppFouls = uint8_t(std::clamp(oppFouls, 0, 255));
 		if (tt.empty()) {
 			tt.resize(size_t(1) << TT_BITS);
 			hist.assign(2 * 65536, 0);

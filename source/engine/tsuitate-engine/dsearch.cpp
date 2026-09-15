@@ -371,8 +371,9 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 
 	// --- 置換表プローブ(§3.2。ctx == nullptr なら従来と完全に同一の経路) ---
 	//
-	// 値によるカットオフは**同世代のエントリだけ**に許す(理由は SearchContext の
-	// コメント)。旧世代・浅いエントリでも指し手(move16)はオーダリングに使う。
+	// 値によるカットオフは**保存時と現在の oppFouls が一致する**エントリにだけ許す
+	// (理由は SearchContext のコメント。反則のやり直しや手番跨ぎでも oppFouls が
+	// 同じなら値は有効)。不一致・浅いエントリでも指し手(move16)はオーダリングに使う。
 	const Value alphaOrig = alpha;
 	uint16_t    ttRaw     = 0;
 	TTEntry*    tte       = nullptr;
@@ -380,7 +381,7 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 		tte = &ctx->slot(pos.key());
 		if (tte->key == pos.key()) {
 			ttRaw = tte->move16;
-			if (tte->gen == ctx->gen && tte->depth >= depth) {
+			if (tte->oppFouls == ctx->curOppFouls && tte->depth >= depth) {
 				Value v = value_from_tt(tte->value, ply);
 				if (tte->bound == BOUND_EXACT
 				    || (tte->bound == BOUND_LOWER && v >= beta)
@@ -398,6 +399,13 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 	}
 #endif
 
+	// 捕獲判定(着手前の局面で評価する)。オーダリングの帯分けと killer/history の
+	// 更新条件の両方がこれを使う ―― 定義が2か所に割れると、片方だけ変えたときに
+	// killer に捕獲が混ざる/捕獲が history 帯に落ちる、が黙って起きる。
+	auto is_capture = [&pos](Move m) {
+		return !m.is_drop() && pos.piece_on(m.to_sq()) != NO_PIECE;
+	};
+
 	std::vector<std::pair<int, Move>> moves;
 	for (auto ext : MoveList<LEGAL_ALL>(pos)) {
 		Move m = ext;
@@ -410,7 +418,7 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 			// 下に沈むことがあった)。この並びは tt フラグの下でだけ有効。
 			if (m.raw() == ttRaw && ttRaw != 0) {
 				s = 1 << 30;
-			} else if (!m.is_drop() && pos.piece_on(m.to_sq()) != NO_PIECE) {
+			} else if (is_capture(m)) {
 				s = (1 << 20) + order_score(pos, m);
 			} else {
 				if (m == ctx->killer[ply][0])
@@ -445,7 +453,8 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 				alpha = v;
 				if (alpha >= beta) {
 					// beta カット: quiet なら killer / history を更新
-					if (ctx && (m.is_drop() || pos.piece_on(m.to_sq()) == NO_PIECE)) {
+					// (undo_move 済みなので pos は着手前 = is_capture の前提どおり)
+					if (ctx && !is_capture(m)) {
 						if (ctx->killer[ply][0] != m) {
 							ctx->killer[ply][1] = ctx->killer[ply][0];
 							ctx->killer[ply][0] = m;
@@ -468,14 +477,15 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 		const bool keep = tte->key == pos.key() && tte->gen == ctx->gen
 		                  && tte->depth > depth;
 		if (!keep) {
-			tte->key    = pos.key();
-			tte->value  = value_to_tt(best, ply);
+			tte->key      = pos.key();
+			tte->value    = value_to_tt(best, ply);
 			// fail-low(UPPER)の bestMove は「最善の証明」ではないが、
 			// オーダリングのヒントとしては十分機能するので保存する
-			tte->move16 = bestMove.raw();
-			tte->depth  = int8_t(std::min(depth, 127));
-			tte->bound  = best >= beta ? BOUND_LOWER : best > alphaOrig ? BOUND_EXACT : BOUND_UPPER;
-			tte->gen    = ctx->gen;
+			tte->move16   = bestMove.raw();
+			tte->depth    = int8_t(std::min(depth, 127));
+			tte->bound    = best >= beta ? BOUND_LOWER : best > alphaOrig ? BOUND_EXACT : BOUND_UPPER;
+			tte->oppFouls = ctx->curOppFouls;
+			tte->gen      = ctx->gen;
 		}
 	}
 	return best;

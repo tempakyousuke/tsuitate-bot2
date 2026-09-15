@@ -294,10 +294,15 @@ struct Config {
 	// 粒子数が目標のこの割合(%)以上あれば再生成をまるごと省く。
 	// 低いと時間は浮くが人口が痩せたまま(=p_legalの分解能と信念の多様性が落ちる)。
 	int  regenFloorPct  = 50;
-	// 思考のワーカースレッド数(§3.1 粒子並列)。1で従来どおりの逐次実行
+	// 思考のワーカースレッド数(§3.1 粒子並列)。1(既定)で従来どおりの逐次実行
 	// (コード経路も完全に同一。並列版はフラグの後ろに置く、の原則)。
 	// 粒子はほぼ独立なので、stage1/stage2(確定化探索)と信念の再生成・合成を
 	// 粒子単位で分割する。同じ予算でも粒子数と深さが実質スレッド数倍になる。
+	//
+	// 0 = auto: 使えるCPU数(ハードウェア並列度と cgroup クォータの小さいほう、
+	// 上限16)を effective_threads が解決する。CPU数の自動判定はエンジンの
+	// ここ1か所だけに置く(起動側が自前で数えると cgroup 対応などの修正が
+	// 言語をまたいで二重になる)。ブリッジは未指定時に `set threads 0` を送る。
 	int  threads        = 1;
 	// 確定化探索の置換表 + killer/history オーダリング(§3.2)。0で従来どおり。
 	// stage2 の反復深化(d=2,4,6…)が同じ部分木を読み直すぶんが主な回収源。
@@ -370,11 +375,14 @@ double foul_value(double baseCp, double stepCp, int fouls);
 void run_workers(int nThreads, const std::function<void(int)>& fn);
 
 // 実効ワーカー数 = min(cfg.threads, ハードウェア並列度, cgroupのCPUクォータ)。
+// cfg.threads == 0 は auto(使えるCPU数、上限16)。
 // threads は利用可能CPUより大きく設定できてしまうが、実CPUを超えたワーカーは
 // 生成コストとオーバーサブスクリプション(締め切り判定はスケジュールされた
 // ときにしか走らない = thinkが予算を超過する)で逆効果にしかならない。
 // hardware_concurrency() は cgroup の CPU クォータ(cpu.max / cfs_quota)を
-// 反映しないので、クォータも直接読んで小さいほうを使う(コンテナ対策)。
+// 反映しないので、クォータも直接読んで小さいほうを使う。クォータは
+// /proc/self/cgroup から自分のパスを引いて祖先ごと確認する(名前空間なしの
+// ネスト cgroup(systemd の CPUQuota 等)ではルート固定パスに現れないため)。
 // どちらも不明な環境では設定値をそのまま使う。
 int effective_threads(const Config& cfg);
 
