@@ -86,6 +86,7 @@ npm start
 | `oppfoulcap` | 2.0 | 1手番あたりの相手の期待反則回数の上限 |
 | `oppfoulmax` | 800 | 相手の反則項が1つの相手ノードで動かせる評価の上限(cp)。局面評価の飽和(±2500)を超えさせない |
 | `oppcheckprior` | 0 | 王手されている相手が「玉を逃がしたがる」ことをpriorに反映する。信念側の方策とも共有しているので、`oppmodel` とは独立にA/Bすること |
+| `priorfit` | 0 | 相手priorの重み表。0=手書き / 1=アリーナの完全情報に適合した重み(王手の反映込み。docs/strengthening.md 4章)。適合は `arena ... dump <path>` で教師データを取り `tools/fit_policy.py` で行う |
 
 ## ローカルでの検証
 

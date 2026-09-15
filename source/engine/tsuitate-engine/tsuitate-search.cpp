@@ -124,6 +124,8 @@ bool set_config_key(Config& c, const std::string& key, const std::string& val) {
 	// 0 = stage1は従来の千里眼qsearchのまま
 	else if (key == "oppreplykstage1") apply_i(c.oppReplyKStage1, 0, 128);
 	else if (key == "oppcheckprior") apply_i(c.oppCheckPrior, 0, 1);
+	// §4 prior較正: 0=手書き / 1=適合済み重み表(王手の反映込み。Config参照)
+	else if (key == "priorfit")     apply_i(c.priorFit, 0, 1);
 	else if (key == "opplambda")    apply_d(c.oppLambda, 0.0, 1.0);
 	// 相手の期待反則回数の上限。1手番で相手が10回反則すれば即負けなので、
 	// 意味のある範囲は高々数回。青天井にすると相手の反則を当てにした
@@ -226,6 +228,59 @@ void cmd_check_intents(long long games, long long maxPlies) {
 	          << (missing == 0 ? "  OK (意図 ⊇ 合法手)" : "  FAILED") << sync_endl;
 }
 
+// §4 の不変条件検査: fast_policy_score(高速な整数演算) ==
+// Σ PolicyWeights[k] × policy_features[k](ダンプ・適合が使う線形形)。
+// 両者が食い違うと、オフラインで適合した重みが実行時と別のモデルになる。
+// 手書き/適合×王手反映の全組み合わせで検査する。
+void cmd_check_policy(long long games, long long maxPlies) {
+	PRNG rng(20260914);
+	long long positions = 0, scored = 0, mismatch = 0;
+	Config cfgs[3];
+	cfgs[1].oppCheckPrior = 1;   // 手書き + 王手反映
+	cfgs[2].priorFit      = 1;   // 適合表(王手反映は常時)
+	for (long long g = 0; g < games; ++g) {
+		Position pos;
+		std::deque<StateInfo> sts;
+		sts.emplace_back();
+		pos.set_hirate(&sts.back());
+		for (long long p = 0; p < maxPlies; ++p) {
+			MoveList<LEGAL_ALL> ml(pos);
+			if (ml.size() == 0)
+				break;
+			const Color side    = pos.side_to_move();
+			const bool  inCheck = pos.in_check();
+			std::vector<OppIntent> intents;
+			int8_t phi[PF_DIM];
+			for (const Config& c : cfgs) {
+				enumerate_opp_intents(pos, side, intents, inCheck, c);
+				const PolicyWeights& W = c.priorFit ? POLICY_W_FIT : POLICY_W_HAND;
+				const bool checkAware =
+				    inCheck && (c.oppCheckPrior != 0 || c.priorFit != 0);
+				for (const auto& it : intents) {
+					policy_features(pos, side, it.m, checkAware, phi);
+					long long dot = 0;
+					for (int k = 0; k < PF_DIM; ++k)
+						dot += (long long) policy_weight_at(W, k) * phi[k];
+					if (dot != it.score) {
+						++mismatch;
+						if (mismatch <= 5)
+							sync_cout << "info string POLICY MISMATCH move "
+							          << to_usi_string(it.m) << " score=" << it.score
+							          << " dot=" << dot << " sfen " << pos.sfen()
+							          << sync_endl;
+					}
+					++scored;
+				}
+			}
+			++positions;
+			pos.do_move(ml.at(rng.rand<uint64_t>() % ml.size()), sts.emplace_back());
+		}
+	}
+	sync_cout << "info string checkpolicy positions=" << positions
+	          << " scored=" << scored << " mismatch=" << mismatch
+	          << (mismatch == 0 ? "  OK (score == W·phi)" : "  FAILED") << sync_endl;
+}
+
 class ProtocolLoop {
 public:
 	int run() {
@@ -311,6 +366,33 @@ private:
 				sync_cout << "info string checkintents aborted" << sync_endl;
 			else
 				cmd_check_intents(games, plies);
+		}
+		else if (cmd == "checkpolicy") {
+			// checkpolicy [games] [maxplies] — §4 の不変条件
+			// (fast_policy_score == W·policy_features)のランダム検証。
+			// 引数の検証規約は checkintents と同じ(黙って既定値に落とさない)。
+			long long games = 200, plies = 120;
+			bool bad = false;
+			auto arg = [&](const char* name, long long lo, long long hi, long long& out) {
+				std::string v;
+				if (!(is >> v))
+					return false;
+				long long x = 0;
+				if (!parse_ll(v, x) || x < lo || x > hi) {
+					sync_cout << "info string bad checkpolicy option: " << name
+					          << " = " << v << " (" << lo << ".." << hi << ")" << sync_endl;
+					bad = true;
+					return false;
+				}
+				out = x;
+				return true;
+			};
+			if (arg("games", 1, 100000, games))
+				arg("maxplies", 1, 100000, plies);
+			if (bad)
+				sync_cout << "info string checkpolicy aborted" << sync_endl;
+			else
+				cmd_check_policy(games, plies);
 		}
 		else
 			sync_cout << "info string unknown command: " << cmd << sync_endl;
@@ -540,6 +622,17 @@ private:
 			else if (tok == "seed") {
 				if (num("seed", 0, INT64_MAX, x))
 					opt.seed = uint64_t(x);
+			}
+			// §4 prior較正の教師データ(JSONL)の出力先
+			else if (tok == "dump") {
+				std::string v;
+				if (!(is >> v)) {
+					sync_cout << "info string bad arena option: dump needs a path"
+					          << sync_endl;
+					bad = true;
+				} else {
+					opt.dumpPath = v;
+				}
 			}
 			// A/B比較: 片側だけ設定を変えて同一バイナリ内で対戦させる
 			else if (tok == "p1cfg" || tok == "p2cfg") {
