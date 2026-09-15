@@ -63,6 +63,16 @@ struct ArenaStats {
 	double    essSum = 0;  // §2 SIR: 実効サンプル数(sir=0では粒子数と同じ)
 	// 探索スループット(§3.1/§3.2の採用ゲート用)。決定ごとに集計する。
 	long long nodesSum = 0, thinkMsSum = 0, depthSum = 0;
+	// §9 stage2 スケジューリング診断(決定ごと)。
+	//   depthHist[d]: stage2 の完了深さ d の決定数(7以上は7にまとめる)
+	//   jobs2/trunc2: stage2 ジョブ数とノード上限で汚れたジョブ数
+	//   gateSkipped : 深いパスが残っていたのに開始ゲートで止めた決定数
+	long long depthHist[8] = {};
+	long long jobs2 = 0, trunc2 = 0, gateSkipped = 0;
+	// 深さ d のパスの所要時間の合計と本数(passgrowth の較正用。7以上は7)
+	long long passMsSum[8] = {}, passCnt[8] = {};
+	long long syncMsSum = 0, stage1MsSum = 0, stage2MsSum = 0;  // 予算内訳(決定ごと)
+	long long candsSum = 0, jobs1Sum = 0;  // 候補数と stage1 ジョブ数(決定ごと)
 	double    pLegalSum = 0;     // 整数%で持つと二重に切り捨てて0.5pp沈むのでdoubleで持つ
 	long long relaxHist[4] = {};  // 緩和レベル別の手番数(3=合成粒子)
 	double    kingAccSum = 0, occAccSum = 0;
@@ -79,6 +89,19 @@ struct ArenaStats {
 		nodesSum   += (long long) r.nodes;
 		thinkMsSum += (long long) r.elapsedMs;
 		depthSum   += r.depthReached;
+		depthHist[std::clamp(r.depthReached, 0, 7)]++;
+		jobs2       += (long long) r.jobs2;
+		trunc2      += (long long) r.trunc2;
+		gateSkipped += r.gateSkipped;
+		syncMsSum   += (long long) r.syncMs;
+		stage1MsSum += (long long) r.stage1Ms;
+		stage2MsSum += (long long) r.stage2Ms;
+		candsSum    += (long long) r.cands;
+		jobs1Sum    += (long long) r.jobs1;
+		for (auto& [d, ms] : r.passes) {
+			passMsSum[std::clamp(d, 0, 7)] += ms;
+			passCnt[std::clamp(d, 0, 7)]++;
+		}
 	}
 	void add_turn(const ThinkResult& r) {
 		turns++;
@@ -564,6 +587,35 @@ void run_arena(const ArenaOptions& opt) {
 		std::cout << " avg_depth=" << (double(g.depthSum) / double(g.decisions))
 		          << " knps=" << (g.thinkMsSum > 0
 		                              ? double(g.nodesSum) / double(g.thinkMsSum) : 0.0);
+		// §9 stage2 スケジューリング診断。depth_hist は完了深さ 0..6 の決定数と 7+。
+		// trunc2 は「stage2 のジョブのうちノード上限で値が汚れた割合」で、
+		// avg_depth が同じでも読めている中身が違うことを検出する。
+		std::cout << " depth_hist=";
+		for (int d = 0; d < 8; ++d)
+			std::cout << (d ? "/" : "") << g.depthHist[d];
+		std::cout << " trunc2=" << (g.jobs2 > 0 ? 100.0 * double(g.trunc2) / double(g.jobs2) : 0.0)
+		          << "%(" << g.trunc2 << "/" << g.jobs2 << ")"
+		          << " gate_skip=" << g.gateSkipped;
+		// 深さ別のパス平均所要時間(ms)。passgrowth = 隣り合う深さの比、が目安
+		std::cout << " pass_ms=";
+		bool first = true;
+		for (int d = 0; d < 8; ++d)
+			if (g.passCnt[d]) {
+				std::cout << (first ? "" : ",") << d << ":"
+				          << (double(g.passMsSum[d]) / double(g.passCnt[d]))
+				          << "(n=" << g.passCnt[d] << ")";
+				first = false;
+			}
+		if (first)
+			std::cout << "-";
+		// 予算の内訳(決定あたり平均ms)。sync が締め切りいっぱいまで使うと
+		// stage2 に残る時間が構造的に決まる
+		std::cout << " ms(sync/s1/s2)=" << (double(g.syncMsSum) / double(g.decisions))
+		          << "/" << (double(g.stage1MsSum) / double(g.decisions))
+		          << "/" << (double(g.stage2MsSum) / double(g.decisions))
+		          // 候補数と stage1 の1候補あたり粒子数(stage1pct の効き方を見る)
+		          << " avg_cands=" << (double(g.candsSum) / double(g.decisions))
+		          << " avg_k1=" << (g.candsSum > 0 ? double(g.jobs1Sum) / double(g.candsSum) : 0.0);
 		if (g.truthSamples)
 			std::cout << " king_acc=" << (100.0 * g.kingAccSum / double(g.truthSamples)) << "%"
 			          << " occ_rec=" << (100.0 * g.occAccSum / double(g.truthSamples)) << "%";
