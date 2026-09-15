@@ -229,9 +229,36 @@ const PolicyWeights POLICY_W_HAND = {
 	/*kingDist*/ 0,
 };
 
-// アリーナ教師データへの適合値(tools/fit_policy.py の出力を貼る。§4)。
-// 適合前は HAND と同値にしておく(priorfit 1 が未適合のまま使われても壊れない)。
-const PolicyWeights POLICY_W_FIT = POLICY_W_HAND;
+// アリーナ教師データへの適合値(tools/fit_policy.py の出力。§4)。
+// 教師: 30局 belief vs heuristic + 30局 belief vs belief(200ms/手・粒子128、
+// seed 901/903)の 9,364決定。held-out log-loss は fit 3.96 / 手書き 5.12 /
+// 一様 4.86 — 手書きpriorは belief の指し手に対して一様より悪かった。
+// 読みどころ: スライダー(香・角・飛)の前進は嫌われる(手書きは+55〜70と
+// 好む側に置いていた)、成りは+300ではなく+125、着地マスは自玉から
+// 遠いほう(kingDist +15/マス)、打ちは手書きの想定よりさらに少数派。
+const PolicyWeights POLICY_W_FIT = {
+	/*center*/ 8, /*dropBase*/ -322, /*dropCamp*/ -85, /*dropCheck*/ -75,
+	/*push*/ {
+		0,    // NO_PIECE_TYPE(意図には現れない)
+		35,   // PAWN
+		-85,  // LANCE
+		43,   // KNIGHT
+		18,   // SILVER
+		-52,  // BISHOP
+		-70,  // ROOK
+		18,   // GOLD
+		0,    // KING(玉移動自体の抑制は kingQuiet/kingCheck)
+		31,   // PRO_PAWN
+		40,   // PRO_LANCE
+		34,   // PRO_KNIGHT
+		7,    // PRO_SILVER
+		43,   // HORSE
+		32,   // DRAGON
+		0,
+	},
+	/*promote*/ 125, /*kingQuiet*/ -201, /*kingCheck*/ 386,
+	/*kingDist*/ 15,
+};
 
 int fast_policy_score(const Position& pos, Color opp, Move m, bool inCheck,
                       const Config& cfg) {
