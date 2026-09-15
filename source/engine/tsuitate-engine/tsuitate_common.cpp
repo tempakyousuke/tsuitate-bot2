@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <thread>
 
 #include "../../bitboard.h"
 
@@ -403,6 +406,169 @@ Move parse_usi_move(const OwnView& view, const std::string& s) {
 	bool promote = s.size() >= 5 && s[4] == '+';
 	return promote ? make_move_promote(from, to, view.us, type_of(pc))
 	               : make_move(from, to, view.us, type_of(pc));
+}
+
+// ---------------------------------------------------------------------------
+// 並列ヘルパ
+// ---------------------------------------------------------------------------
+
+// 毎回 std::thread を生成して join する素朴な実装。常駐プール化は3度検討して
+// 見送っている: 実測の生成コストは threads=4(現行の配備規模)で1手あたり
+// 1ms未満(予算の~0.5%)で、プールの同期バグのリスクに見合わない。
+// threads>8 の配備が現実になったら(1手2〜6ms・1〜2%に育つ)そのとき入れる。
+void run_workers(int nThreads, const std::function<void(int)>& fn) {
+	if (nThreads <= 1) {
+		fn(0);
+		return;
+	}
+	std::vector<std::thread> ts;
+	ts.reserve(size_t(nThreads - 1));
+	for (int w = 1; w < nThreads; ++w)
+		ts.emplace_back([&fn, w] { fn(w); });
+	fn(0);
+	for (auto& t : ts)
+		t.join();
+}
+
+namespace {
+
+// "quota period"(cgroup v2 の cpu.max)を読む。読めない/無制限なら 0。
+int read_v2_cpu_max(const std::string& path) {
+	FILE* f = std::fopen(path.c_str(), "r");
+	if (!f)
+		return 0;
+	char buf[64] = {};
+	size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+	std::fclose(f);
+	if (n == 0 || std::strncmp(buf, "max", 3) == 0)
+		return 0;
+	long long quota = 0, period = 0;
+	if (std::sscanf(buf, "%lld %lld", &quota, &period) == 2 && quota > 0 && period > 0)
+		return int(std::max(1ll, quota / period));
+	return 0;
+}
+
+bool read_ll_file(const std::string& path, long long& out) {
+	FILE* f = std::fopen(path.c_str(), "r");
+	if (!f)
+		return false;
+	bool ok = std::fscanf(f, "%lld", &out) == 1;
+	std::fclose(f);
+	return ok;
+}
+
+// cgroup v1 の cfs_quota/period をディレクトリから読む。制限なしなら 0。
+int read_v1_cfs(const std::string& dir) {
+	long long quota = 0, period = 0;
+	if (read_ll_file(dir + "/cpu.cfs_quota_us", quota)
+	    && read_ll_file(dir + "/cpu.cfs_period_us", period) && quota > 0 && period > 0)
+		return int(std::max(1ll, quota / period));
+	return 0;
+}
+
+// cgroup の CPU クォータ(使えるコア数相当)。読めない・無制限なら 0。
+// クォータはプロセスの生存中に変わらない前提で、初回だけ読んでキャッシュする。
+//
+// **マウントルートの固定パスだけ読むのでは足りない**: cgroup 名前空間のある
+// コンテナ(Docker/K8s)ではルートに自分の cpu.max が見えるが、名前空間なしの
+// ネスト cgroup(systemd の CPUQuota= を掛けたユニット等)では自分のクォータは
+// /sys/fs/cgroup/<自分のパス>/cpu.max にあり、v2 のルートにはそもそも cpu.max が
+// 無い。/proc/self/cgroup で自分のパスを引き、ルートまで遡って(クォータは
+// どの祖先にも掛かりうる)最小値を採用する。
+int detect_cpu_quota() {
+	// /proc/self/cgroup: v2 は "0::<path>"、v1 は "<n>:<ctrls>:<path>" の行が並ぶ
+	std::string v2path, v1path;
+	if (FILE* f = std::fopen("/proc/self/cgroup", "r")) {
+		char line[512];
+		while (std::fgets(line, sizeof(line), f)) {
+			size_t len = std::strlen(line);
+			if (len && line[len - 1] == '\n')
+				line[--len] = '\0';
+			if (std::strncmp(line, "0::", 3) == 0) {
+				v2path = line + 3;
+				continue;
+			}
+			// v1: コントローラ一覧(カンマ区切り)に "cpu" を含む行
+			const char* c1 = std::strchr(line, ':');
+			const char* c2 = c1 ? std::strchr(c1 + 1, ':') : nullptr;
+			if (c1 && c2) {
+				std::string ctrls(c1 + 1, c2);
+				ctrls = "," + ctrls + ",";
+				if (ctrls.find(",cpu,") != std::string::npos)
+					v1path = c2 + 1;
+			}
+		}
+		std::fclose(f);
+	}
+	int best = 0;
+	auto consider = [&](int q) {
+		if (q > 0 && (best == 0 || q < best))
+			best = q;
+	};
+	// 自分のパスからルートへ遡る。p が空になった回でルート自体も読むので、
+	// /proc/self/cgroup が読めない環境でも従来のルート固定読みと同じに縮退する
+	auto walk_up = [](std::string p, const std::function<void(const std::string&)>& visit) {
+		for (;;) {
+			visit(p);
+			if (p.empty() || p == "/")
+				break;
+			size_t pos = p.find_last_of('/');
+			p = (pos == std::string::npos || pos == 0) ? "" : p.substr(0, pos);
+		}
+	};
+	walk_up(v2path, [&](const std::string& p) {
+		consider(read_v2_cpu_max("/sys/fs/cgroup" + p + "/cpu.max"));
+	});
+	walk_up(v1path, [&](const std::string& p) {
+		consider(read_v1_cfs("/sys/fs/cgroup/cpu" + p));
+	});
+	return best;
+}
+
+} // namespace
+
+int effective_threads(const Config& cfg) {
+	unsigned hw = std::thread::hardware_concurrency();
+	// hardware_concurrency は cgroup のクォータを反映しない(affinityベース)ので、
+	// クォータ制限つきコンテナではホストのコア数が返る。クォータも見て絞る。
+	static const int quota = detect_cpu_quota();
+	int t;
+	if (cfg.threads == 0) {
+		// auto: 使えるCPU数(hw と クォータの小さいほう)、安全上限16。
+		// この自動判定はここ**だけ**に置く: 起動側(ブリッジ等)が自前でCPU数を
+		// 数えると、cgroup対応などの修正が言語をまたいで二重になり、必ず片方が
+		// 取り残される。ブリッジは `set threads 0` を送るだけでよい。
+		t = 16;
+		if (hw > 0)
+			t = std::min<int>(t, int(hw));
+		if (quota > 0)
+			t = std::min(t, quota);
+		return std::max(1, t);
+	}
+	t = std::max(1, cfg.threads);
+	if (hw > 0)
+		t = std::min<int>(t, int(hw));
+	if (quota > 0)
+		t = std::min(t, quota);
+	return t;
+}
+
+int resolved_sync_pct(const Config& cfg) {
+	if (cfg.syncPct >= 0)
+		return cfg.syncPct;  // 明示指定
+	return effective_threads(cfg) > 1 ? 55 : 40;
+}
+
+void run_workers_rng(int nw, PRNG& shared, const std::function<void(int, PRNG&)>& fn) {
+	if (nw <= 1) {
+		fn(0, shared);
+		return;
+	}
+	const uint64_t base = shared.rand<uint64_t>();
+	run_workers(nw, [&](int w) {
+		PRNG local((base ^ (uint64_t(w) * 0x9e3779b97f4a7c15ull)) | 1);
+		fn(w, local);
+	});
 }
 
 } // namespace Tsuitate

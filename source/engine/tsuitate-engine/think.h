@@ -13,6 +13,7 @@
 
 #include "tsuitate_common.h"
 #include "belief.h"
+#include "dsearch.h"
 
 #if defined(TSUITATE_ENGINE)
 
@@ -27,7 +28,15 @@ struct ThinkResult {
 	int         relaxLevel = 0;   // 診断表示用(0..3)
 	double      relaxMean = 0;    // 反則コスト割増に使う連続値
 	int         depthReached = 0;
+	uint64_t    nodes = 0;        // 確定化探索の総ノード数(診断。nodes/sの分子)
 	TimePoint   elapsedMs = 0;
+
+	// スループット(kilo nodes / 秒 = nodes / 経過ms)。分母は信念同期込みの
+	// 思考時間全体。knps の**定義はここ1つ**: 実対局の info 行も、アリーナ診断
+	// (合計値のプール)も同じ「nodes/経過ms」で、配備とアリーナのゲート数値を
+	// そのまま突き合わせられるようにする(式が2か所に分かれて整数除算などで
+	// ずれると、スループット退行の監視という目的自体が壊れる)。
+	double knps() const { return elapsedMs > 0 ? double(nodes) / double(elapsedMs) : 0.0; }
 };
 
 class Thinker {
@@ -35,6 +44,23 @@ public:
 	ThinkResult think(const OwnView& view, Belief& belief, const GameHistory& hist,
 	                  const std::vector<Move>& foulTried, int budgetMs,
 	                  const Config& cfg, PRNG& rng);
+
+	// 対局開始時に呼ぶ。探索コンテキスト(置換表・history)を破棄して、
+	// 前の対局のエントリが次の対局に持ち越されないようにする
+	// (world(手番色・反則経済)が違う対局の値でカットオフさせない)。
+	void new_game() {
+		ctx_.clear();
+		thinkStamp_ = 0;
+	}
+
+private:
+	// §3.2 ワーカースレッドごとの探索コンテキスト(置換表 + history)。
+	// cfg.tt != 0 のときだけ確保する。手番をまたいで保持し、世代で無効化する
+	// (詳細は dsearch.h の SearchContext)。
+	std::vector<std::unique_ptr<SearchContext>> ctx_;
+	// think() の通し番号。SearchContext::stamp と突き合わせて
+	// 「この think でもう begin_think したか」をワーカー自身が判定する。
+	uint32_t thinkStamp_ = 0;
 };
 
 // ---------------------------------------------------------------------------

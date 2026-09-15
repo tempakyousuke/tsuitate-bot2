@@ -13,8 +13,90 @@
 
 #if defined(TSUITATE_ENGINE)
 
+#include <algorithm>
+
 namespace YaneuraOu {
 namespace Tsuitate {
+
+// ---------------------------------------------------------------------------
+// 探索コンテキスト(置換表 + history)。§3.2 探索の底上げ。
+// ---------------------------------------------------------------------------
+// DSearch は (候補手, 粒子) のジョブごとに使い捨てなので、ジョブをまたいで
+// 生かしたい状態はここに置く。**ワーカースレッドごとに1つ**持つ(ロック不要)。
+// 反復深化(stage2 の d=2,4,6…)は同じ部分木を深さを変えて読み直すので、
+// 前のパスの結果が置換表に残っていると枝刈りとオーダリングが大きく効く。
+//
+// 値カットオフのゲートは**保存時の oppFouls と現在の oppFouls の一致**で行う。
+// 当初は「同世代(=同じthink)のみ」で代理していたが、それは真の不変条件
+// (foulGain = oppFouls の関数、が変わっていないこと)より遥かに強すぎる:
+// 自分の反則のやり直し(同一局面・oppFouls不変 = TT再利用の理想形)でも
+// 手番が変わるたびでも、まだ有効な値を全部捨てていた。oppFouls を
+// エントリに保存して一致を要求すれば、必要十分のゲートになる
+// (us と cfg は対局内で不変、コンテキストは対局開始で破棄、
+//  相手ノードは TT を通らないので ply 依存の反則項は混入しない)。
+// gen は置換の老化(同一thinkのエントリを深さ優先で守る)にだけ使う。
+//
+// 既知のトレードオフ(tt > 0 かつ threads > 1 のとき): TT/history はワーカー
+// ローカルで、粒子グループ→ワーカーの割当は atomic カウンタの動的スケジュール
+// なので、**ジョブの評価値自体が「どのワーカーが先にどのグループを取ったか」に
+// 依存する**。think() の固定順還元は加算順しか固定しないため、tt を有効にすると
+// 同一 seed でも実行ごとに選ぶ手が変わりうる(seed からの再現デバッグが不能)。
+// 実験フラグとして許容している。再現性が要るなら割当を静的(g % nw)にすること。
+struct TTEntry {
+	uint64_t key   = 0;  // pos.key()(0 = 空きスロット)
+	int16_t  value = 0;  // value_to_tt 済み(詰みはply補正済み)
+	uint16_t move16 = 0; // 最善手(Move::raw()。オーダリング用)
+	int8_t   depth = -1;
+	Bound    bound = BOUND_NONE;   // types.h の共通enum(独自enumで数値をずらさない)
+	uint8_t  oppFouls = 0;         // 保存時の相手反則累計(値カットオフのゲート。0..10)
+	uint8_t  gen   = 0;            // 置換の老化用(一巡しても値の正しさには関わらない)
+};
+static_assert(sizeof(TTEntry) == 16, "TTEntry should stay 16 bytes");
+
+struct SearchContext {
+	static constexpr size_t TT_BITS = 20;                  // 2^20 = 1M エントリ(16MB)
+	static constexpr int    HIST_MAX = 16384;              // history の飽和値
+	std::vector<TTEntry> tt;
+	// history[手番(0=BLACK)][Move::raw()]。quietの beta カットで depth^2 を加点
+	std::vector<int16_t> hist;
+	// killer もここに置く(ワーカーごと・think ごとにクリア)。DSearch のメンバに
+	// すると (候補,粒子) ジョブごとの構築で毎回 ~2KB のゼロ初期化が走り、
+	// killer を一度も読まない既定(tt 0)経路まで恒常コストを払うことになる。
+	Move     killer[MAX_PLY][2];
+	uint8_t  gen   = 0;
+	// 現在の相手反則累計(think() 開始時に begin_think へ渡される)。
+	// 値カットオフは tte->oppFouls == curOppFouls のエントリにだけ許す。
+	uint8_t  curOppFouls = 0;
+	// この think() でもう begin_think 済みかの判定(Thinker が通し番号を発行)。
+	// コンテキストは1リージョン内では担当ワーカーだけが触り、リージョン間は
+	// run_workers の join が順序づけるので、単純な比較で足りる。
+	uint32_t stamp = 0;
+
+	// think() ごと・ワーカーごとに1回。
+	//   - 初回は割り当て(16MB)をここで行う: 呼び出しスレッドで全ワーカー分を
+	//     まとめて確保すると、初手の予算内で workers×16MB のゼロ初期化と
+	//     first-touch が直列に走ってしまう。ワーカー自身にやらせて分散する
+	//   - 2回目以降は置換老化用の世代を進め、history は半減させる
+	//     (減衰なしだと長い対局で飽和して序列の分解能が落ちる)
+	// oppFouls: 現在の相手反則累計(値カットオフのゲートに使う)
+	void begin_think(int oppFouls) {
+		curOppFouls = uint8_t(std::clamp(oppFouls, 0, 255));
+		if (tt.empty()) {
+			tt.resize(size_t(1) << TT_BITS);
+			hist.assign(2 * 65536, 0);
+		} else {
+			++gen;
+			for (auto& h : hist)
+				h = int16_t(h / 2);
+		}
+		for (int p = 0; p < MAX_PLY; ++p)
+			killer[p][0] = killer[p][1] = Move::none();
+	}
+	TTEntry& slot(uint64_t key) { return tt[key & ((size_t(1) << TT_BITS) - 1)]; }
+	int16_t& hist_of(Color side, uint16_t raw16) {
+		return hist[(side == BLACK ? 0 : 65536) + raw16];
+	}
+};
 
 struct DSearch {
 	// nodesLimit: このノード数を超えたら打ち切って静的評価を返す(粒子1つ分の保険)
@@ -33,6 +115,11 @@ struct DSearch {
 	Color         us       = COLOR_NB;
 	double        foulGain = 0.0;
 	int           oppK1    = 0;
+
+	// --- §3.2 置換表 + オーダリング(cfg->tt != 0 のときだけ think() が設定する) ---
+	// nullptr なら従来の探索(MVV-LVAのみ)と完全に同一の経路。
+	// killer は ctx 側(ワーカーごと、think ごとにクリア)。
+	SearchContext* ctx = nullptr;
 
 	// ply==1 の相手ノードが「確率混合の値」を返したか(呼び出しごとに1回だけ立つ)。
 	//

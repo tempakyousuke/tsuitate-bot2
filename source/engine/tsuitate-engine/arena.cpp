@@ -59,6 +59,8 @@ struct ArenaStats {
 	// 平均が反則率で重み付いてしまう。設定間で比べる指標はすべて手番単位で取る。
 	long long turns = 0;
 	long long particleSum = 0, zeroParticle = 0;
+	// 探索スループット(§3.1/§3.2の採用ゲート用)。決定ごとに集計する。
+	long long nodesSum = 0, thinkMsSum = 0, depthSum = 0;
 	double    pLegalSum = 0;     // 整数%で持つと二重に切り捨てて0.5pp沈むのでdoubleで持つ
 	long long relaxHist[4] = {};  // 緩和レベル別の手番数(3=合成粒子)
 	double    kingAccSum = 0, occAccSum = 0;
@@ -72,6 +74,9 @@ struct ArenaStats {
 			decisionsAtZero++;
 		else if (r.relaxLevel > 0)
 			decisionsAtRelax++;
+		nodesSum   += (long long) r.nodes;
+		thinkMsSum += (long long) r.elapsedMs;
+		depthSum   += r.depthReached;
 	}
 	void add_turn(const ThinkResult& r) {
 		turns++;
@@ -363,6 +368,13 @@ void run_arena(const ArenaOptions& opt) {
 			          << " は粒子数 " << want << " では下限 " << hardMin
 			          << " 個(=" << (100 * hardMin / (want ? want : 1))
 			          << "%)に床上げされます" << std::endl;
+		// 並列なのに信念への予算配分が明示指定で低い組は実測43.3%の未較正構成
+		// (3.4章)。意図的なA/B(まさにその測定)でも使うので挙動は変えないが、
+		// 気づかず踏んでいるケースのために注記は出す(実対局の new と同じ条件)。
+		if (effective_threads(c) > 1 && c.syncPct >= 0 && c.syncPct < 50)
+			std::cout << "info string note: p" << (k + 1) << " threads>1 で syncpct="
+			          << c.syncPct << " は未較正の組です(並列時の較正値は55。"
+			          << "docs/strengthening.md 3.4章)" << std::endl;
 		// blockcp が黙って無効化される/二重に効くと「効かないつまみをスイープして
 		// いる」ことに気づけない(A/Bが丸ごと無意味になる)。
 		// 条件は think.cpp の oppNodeCountsFouls と厳密に揃えること。
@@ -475,6 +487,13 @@ void run_arena(const ArenaOptions& opt) {
 		          // zero_particle / relax(...) と突き合わせられない
 		          << " (after_zero=" << g.foulsAfterZero << "/" << g.decisionsAtZero
 		          << " after_relax=" << g.foulsAfterRelax << "/" << g.decisionsAtRelax << ")";
+		// 探索スループット(§3.1/§3.2 の採用ゲート)。knps の分母は思考時間全体
+		// (信念の同期込み)なので、探索だけの nodes/s より低めに出る点に注意。
+		// 定義は ThinkResult::knps() と同じ「nodes/経過ms」(こちらは全決定の
+		// 合計同士の比 = 時間で重み付いたプール平均)。式を変えるときは両方揃えること。
+		std::cout << " avg_depth=" << (double(g.depthSum) / double(g.decisions))
+		          << " knps=" << (g.thinkMsSum > 0
+		                              ? double(g.nodesSum) / double(g.thinkMsSum) : 0.0);
 		if (g.truthSamples)
 			std::cout << " king_acc=" << (100.0 * g.kingAccSum / double(g.truthSamples)) << "%"
 			          << " occ_rec=" << (100.0 * g.occAccSum / double(g.truthSamples)) << "%";

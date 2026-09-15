@@ -108,12 +108,39 @@ class Engine {
 	}
 }
 
+// TSUITATE_ENGINE_OPTS は一度だけパースし、「指定済みキーの判定」と「送信」の
+// 両方に**同じ Map** を使う(判定だけ別のregexで再実装すると、区切り規則が
+// ずれたときに明示設定を黙って上書き/自動設定を黙って欠落させる)。
+// Map は**後勝ち**: エンジンも最後に送られた `set` を採用するので、キーが
+// 重複したときの解釈を揃える。エンジンのキーはすべて「キー + 値1つ」なので、
+// トークンが2つでないエントリはカンマ漏れの可能性が高い —— 黙って一部だけ
+// 適用される(エンジン側も行ごと拒否する)ので、ここでも起動時に警告する。
+const engineOptMap = new Map<string, string>();
+for (const raw of engineOptions.split(',')) {
+	const kv = raw.trim().replace(/[=:]/g, ' ');
+	if (!kv) continue;
+	const sp = kv.split(/\s+/);
+	if (sp.length !== 2) {
+		console.error(
+			`TSUITATE_ENGINE_OPTS のエントリ "${raw.trim()}" は「キー 値」の形ではありません` +
+				'(カンマ区切りの漏れ?)。エンジンにはそのまま送りますが、拒否されます。',
+		);
+	}
+	engineOptMap.set(sp[0], sp.slice(1).join(' '));
+}
+
 const engine = new Engine(enginePath);
 engine.send('usi');
-for (const opt of engineOptions.split(',')) {
-	const kv = opt.trim();
-	if (kv) engine.send(`set ${kv.replace(/[=:]/g, ' ')}`);
-}
+
+// 既定でCPUぶんのワーカースレッドを使う(§3.1 粒子並列。4コアで実効3.8倍)。
+// `threads 0` = auto で、使えるCPU数の判定(ハードウェア並列度・cgroupクォータ・
+// 上限16)は**エンジン側**の effective_threads がすべて行う。ブリッジで数えると
+// 同じ cgroup 検出を2言語で持つことになり、修正が必ず片方に取り残される。
+// syncpct の auto 解決(実効スレッド数>1 なら 55 —— 探索だけ並列化すると
+// 反則経済が崩れる較正知識、docs/strengthening.md 3.4章)も同様にエンジン側。
+// エンジンは対局開始時に実効値を info 行で報告する。
+if (!engineOptMap.has('threads')) engine.send('set threads 0');
+for (const [k, v] of engineOptMap) engine.send(`set ${k} ${v}`.trimEnd());
 
 // ---------------------------------------------------------------------------
 // Socket.IO 接続と対局ループ

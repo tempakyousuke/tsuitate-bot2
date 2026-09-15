@@ -142,6 +142,12 @@ bool set_config_key(Config& c, const std::string& key, const std::string& val) {
 	else if (key == "deduce")       apply_i(c.deduce, 0, 1);
 	else if (key == "synthprior")   apply_i(c.synthPrior, 0, 1);
 	else if (key == "syncpct")      apply_i(c.syncPct, 0, 100);
+	// ワーカースレッド数(§3.1 粒子並列)。1で従来どおりの逐次実行。
+	// 0 = auto(使えるCPU数 = min(ハードウェア並列度, cgroupクォータ, 16)を
+	// effective_threads が解決する。CPU数の自動判定はエンジンのここ1か所)。
+	else if (key == "threads")      apply_i(c.threads, 0, 64);
+	// 置換表 + killer/history オーダリング(§3.2)。0で従来どおり。
+	else if (key == "tt")           apply_i(c.tt, 0, 1);
 	else if (key == "regenfloor")   apply_i(c.regenFloorPct, 0, 100);
 	else if (key == "loglevel")     apply_i(c.logLevel, 0, 2);
 	else if (key == "policytemp")   apply_d(c.policyTemp, 1.0, 100000.0);
@@ -310,8 +316,18 @@ private:
 	}
 
 	void cmd_set(std::istringstream& is) {
-		std::string key, val;
+		std::string key, val, extra;
 		is >> key >> val;
+		// 余剰トークンは黙って捨てない。`set tt 1 threads 2`(TSUITATE_ENGINE_OPTS の
+		// カンマ漏れが典型)を黙って `tt=1` だけ適用すると、落ちた `threads 2` の
+		// ぶんだけ意図と違う構成で対局が始まり、どこにもエラーが出ない。
+		// 部分適用はせず、行ごと拒否して気づかせる。
+		if (is >> extra) {
+			sync_cout << "info string bad option: `" << key << " " << val << " " << extra
+			          << " ...` (setは1回に1キー。TSUITATE_ENGINE_OPTS のカンマ漏れ?)"
+			          << sync_endl;
+			return;
+		}
 		if (!set_config_key(cfg_, key, val)) {
 			sync_cout << "info string bad option: " << key << " = " << val << sync_endl;
 			return;
@@ -326,6 +342,23 @@ private:
 		core_.new_game(us, cfg_);
 		inGame_ = true;
 		sync_cout << "info string new game as " << (us == BLACK ? "sente" : "gote") << sync_endl;
+		// 実効値の可視化: threads はハードウェア並列度と cgroup クォータで
+		// クランプ(0=autoはここで解決)され、syncpct は -1(auto)だと
+		// 実効スレッド数から解決される。設定値と実効値がずれたとき
+		// (クォータ制限コンテナ等)に黙って未較正の組で動かないよう、
+		// 確定した値をここで必ず1行出す。
+		const int effTh = effective_threads(cfg_);
+		sync_cout << "info string effective threads=" << effTh
+		          << " (set " << (cfg_.threads == 0 ? std::string("auto")
+		                                            : std::to_string(cfg_.threads)) << ")"
+		          << " syncpct=" << resolved_sync_pct(cfg_)
+		          << (cfg_.syncPct < 0 ? " (auto)" : "") << sync_endl;
+		// 並列なのに信念への予算配分が明示指定で低いままの組は、実測で43.3%に沈んだ
+		// 未較正構成(docs/strengthening.md 3.4章)。明示指定は尊重するが黙らない。
+		if (effTh > 1 && cfg_.syncPct >= 0 && cfg_.syncPct < 50)
+			sync_cout << "info string note: threads=" << effTh << " で syncpct="
+			          << cfg_.syncPct << " は未較正の組です(並列時の較正値は55。"
+			          << "docs/strengthening.md 3.4章)" << sync_endl;
 		// 設定が確定するのは対局開始時(`set` は1キーずつなので順序に依存する)。
 		// blockcp が黙って無効化されると「効かないつまみを回している」ことに
 		// 気づけないので、ここで一度だけ知らせる。アリーナは run_arena で
@@ -421,6 +454,11 @@ private:
 			          << " p_legal=" << int(r.pLegal * 100) << "%"
 			          << " cp=" << int(r.expectedCp)
 			          << " depth=" << r.depthReached
+			          // nodes/knps は §3.1/§3.2 の採用ゲート指標。アリーナ診断にしか
+			          // 出さないと、配備(ブリッジ経由)でのスループット退行が見えない。
+			          // 式は ThinkResult::knps() に一本化(アリーナ側と同じ定義)
+			          << " nodes=" << r.nodes
+			          << " knps=" << int(r.knps())
 			          << " time=" << r.elapsedMs << "ms" << sync_endl;
 		if (r.best == Move::none())
 			sync_cout << "bestmove resign" << sync_endl;
