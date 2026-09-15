@@ -207,10 +207,11 @@ std::vector<Move> generate_candidates(const OwnView& view) {
 // 相手の意図(非千里眼モデル)
 // ---------------------------------------------------------------------------
 
-int fast_policy_score(const Position& pos, Color opp, Move m, bool inCheck,
-                      const Config& cfg) {
-	// 駒種ごとの「前進したさ」(centipawn相当)
-	static const int PUSH[PIECE_TYPE_NB] = {
+// §4 prior較正: 重み表。並び・意味は PolicyWeights / PolicyFeature を参照。
+// HAND は従来 fast_policy_score にベタ書きされていた値そのもの(挙動は完全に同一)。
+const PolicyWeights POLICY_W_HAND = {
+	/*center*/ 10, /*dropBase*/ -150, /*dropCamp*/ 80, /*dropCheck*/ -200,
+	/*push*/ {
 		0,    // NO_PIECE_TYPE
 		110,  // PAWN
 		70,   // LANCE
@@ -219,29 +220,71 @@ int fast_policy_score(const Position& pos, Color opp, Move m, bool inCheck,
 		55,   // BISHOP
 		65,   // ROOK
 		80,   // GOLD
-		-40,  // KING(前進はむしろ嫌う)
+		-40,  // KING(前進はむしろ嫌う。玉移動自体の抑制は kingQuiet)
 		90, 70, 80, 85,  // PRO_PAWN, PRO_LANCE, PRO_KNIGHT, PRO_SILVER
 		70, 80,          // HORSE, DRAGON
-	};
+		0,
+	},
+	/*promote*/ 300, /*kingQuiet*/ -250, /*kingCheck*/ 400,
+	/*kingDist*/ 0,
+};
+
+// アリーナ教師データへの適合値(tools/fit_policy.py の出力。§4)。
+// 教師: 30局 belief vs heuristic + 30局 belief vs belief(200ms/手・粒子128、
+// seed 901/903)の 9,364決定。held-out log-loss は fit 3.96 / 手書き 5.12 /
+// 一様 4.86 — 手書きpriorは belief の指し手に対して一様より悪かった。
+// 読みどころ: スライダー(香・角・飛)の前進は嫌われる(手書きは+55〜70と
+// 好む側に置いていた)、成りは+300ではなく+125、着地マスは自玉から
+// 遠いほう(kingDist +15/マス)、打ちは手書きの想定よりさらに少数派。
+const PolicyWeights POLICY_W_FIT = {
+	/*center*/ 8, /*dropBase*/ -322, /*dropCamp*/ -85, /*dropCheck*/ -75,
+	/*push*/ {
+		0,    // NO_PIECE_TYPE(意図には現れない)
+		35,   // PAWN
+		-85,  // LANCE
+		43,   // KNIGHT
+		18,   // SILVER
+		-52,  // BISHOP
+		-70,  // ROOK
+		18,   // GOLD
+		0,    // KING(玉移動自体の抑制は kingQuiet/kingCheck)
+		31,   // PRO_PAWN
+		40,   // PRO_LANCE
+		34,   // PRO_KNIGHT
+		7,    // PRO_SILVER
+		43,   // HORSE
+		32,   // DRAGON
+		0,
+	},
+	/*promote*/ 125, /*kingQuiet*/ -201, /*kingCheck*/ 386,
+	/*kingDist*/ 15,
+};
+
+int fast_policy_score(const Position& pos, Color opp, Move m, bool inCheck,
+                      const Config& cfg) {
+	const PolicyWeights& W = cfg.priorFit ? POLICY_W_FIT : POLICY_W_HAND;
 	const Square to = m.to_sq();
 	// 端よりは中央
-	int s = 10 * (4 - std::abs(int(file_of(to)) - int(FILE_5)));
+	int s = W.center * (4 - std::abs(int(file_of(to)) - int(FILE_5)));
 
 	// 王手を宣言された側は「自分が王手されている」ことだけは知っている
 	// (宣言は両者に届く)。ただしどの駒からの王手かは見えないので、
 	// 確実に応じられる手は玉を動かすことしかない。素のpriorは玉移動を
-	// 強く嫌う(下の -250)ので、王手中はその符号を逆転させる。
-	const bool checkAware = inCheck && cfg.oppCheckPrior != 0;
+	// 強く嫌う(kingQuiet)ので、王手中はその符号を逆転させる(kingCheck)。
+	// priorFit=1 は王手の反映込みで較正しているので常に効かせる(Config参照)。
+	const bool checkAware = inCheck && (cfg.oppCheckPrior != 0 || cfg.priorFit != 0);
 
 	if (m.is_drop()) {
 		// 打ちは移動手に比べて少数派。敵陣(=こちら側)への打ち込みは好まれる。
-		s -= 150;
+		s += W.dropBase;
 		if (relative_rank(opp, rank_of(to)) <= RANK_4)
-			s += 80;
+			s += W.dropCamp;
 		// 王手されているのに打つのは「合駒」だが、どこを遮ればよいか見えないので
 		// 相手にとってはほぼ当てずっぽう。玉を逃がす手に比べて選ばれにくい。
 		if (checkAware)
-			s -= 200;
+			s += W.dropCheck;
+		if (W.kingDist != 0)  // 0なら玉位置の参照ごと省く(HANDのホットパスを守る)
+			s += W.kingDist * dist(to, pos.square<KING>(opp));
 		return s;
 	}
 
@@ -250,12 +293,43 @@ int fast_policy_score(const Position& pos, Color opp, Move m, bool inCheck,
 	// 相手から見た前進量。スライダーの大移動は「通ること」自体が稀なので頭打ちにする
 	int adv = int(relative_rank(opp, rank_of(from))) - int(relative_rank(opp, rank_of(to)));
 	adv = std::clamp(adv, -2, 3);
-	s += PUSH[pt] * adv;
+	s += W.push[pt] * adv;
 	if (m.is_promote())
-		s += 300;
+		s += W.promote;
 	if (pt == KING)
-		s += checkAware ? 400 : -250;  // 平時はむやみに動かさない / 王手なら逃げる
+		s += checkAware ? W.kingCheck : W.kingQuiet;  // 平時は動かさない / 王手なら逃げる
+	else if (W.kingDist != 0)
+		s += W.kingDist * dist(to, pos.square<KING>(opp));
 	return s;
+}
+
+// 特徴量(fast_policy_score と1対1。整合は checkpolicy コマンドが検査する)
+void policy_features(const Position& pos, Color side, Move m, bool checkAware,
+                     int8_t phi[PF_DIM]) {
+	std::fill(phi, phi + PF_DIM, int8_t(0));
+	const Square to = m.to_sq();
+	phi[PF_CENTER] = int8_t(4 - std::abs(int(file_of(to)) - int(FILE_5)));
+
+	if (m.is_drop()) {
+		phi[PF_DROP] = 1;
+		if (relative_rank(side, rank_of(to)) <= RANK_4)
+			phi[PF_DROP_CAMP] = 1;
+		if (checkAware)
+			phi[PF_DROP_CHECK] = 1;
+		phi[PF_KING_DIST] = int8_t(dist(to, pos.square<KING>(side)));
+		return;
+	}
+
+	const Square    from = m.from_sq();
+	const PieceType pt   = type_of(pos.piece_on(from));
+	int adv = int(relative_rank(side, rank_of(from))) - int(relative_rank(side, rank_of(to)));
+	phi[PF_PUSH + pt] = int8_t(std::clamp(adv, -2, 3));
+	if (m.is_promote())
+		phi[PF_PROMOTE] = 1;
+	if (pt == KING)
+		phi[checkAware ? PF_KING_CHECK : PF_KING_QUIET] = 1;
+	else
+		phi[PF_KING_DIST] = int8_t(dist(to, pos.square<KING>(side)));
 }
 
 void enumerate_opp_intents(const Position& pos, Color opp, std::vector<OppIntent>& out,

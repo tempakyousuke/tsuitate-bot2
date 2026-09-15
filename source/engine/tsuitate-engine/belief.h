@@ -32,6 +32,10 @@ struct Particle {
 	// (0=全制約を満たすリプレイ / 1,2=制約を外したリプレイ / 3=合成粒子)。
 	// 信念全体の品質はこれを粒子集合から集計して決める(relax_level_of_set)。
 	int                   relax = 0;
+	// §2 SIR: 対数重み。cfg.sir=1 のときだけ動く(0なら常に0=等重み)。
+	// 相手イベントの尤度(反則: 1−p_ok / 着手: 整合手の方策質量)を掛けていき、
+	// sync の最後に平均1へ正規化する。新粒子(再生成・合成)は 0 = 平均重みで入る。
+	double                logw = 0.0;
 
 	Particle() { init(); }
 
@@ -40,6 +44,7 @@ struct Particle {
 		oppMoves.clear();
 		synthetic = false;
 		relax = 0;
+		logw = 0.0;
 		sts.emplace_back();
 		pos.set_hirate(&sts.back());
 	}
@@ -50,6 +55,7 @@ struct Particle {
 		oppMoves.clear();
 		synthetic = true;
 		relax = 3;
+		logw = 0.0;  // 合成 = 観測重みなし(平均重み)で入る
 		sts.emplace_back();
 		return !pos.set(sfen, &sts.back()).has_value();
 	}
@@ -89,6 +95,12 @@ public:
 	int    relaxLevel() const { return relaxLevel_; }
 	double relaxMean() const { return relaxMean_; }
 	size_t cursor() const { return cursor_; }
+	// §2 SIR: この同期で観測(相手イベント)を効かせた直後の実効サンプル数
+	// (リサンプリング前に測る。sir=0 なら常に粒子数と同じ)。診断用。
+	double ess() const { return essLast_; }
+	// §2 SIR: 正規化した重み(合計 = 粒子数。等重みなら全要素1.0)。
+	// think() の p_legal と評価粒子の選択が使う。sir=0 では全要素1.0。
+	void normalized_weights(std::vector<double>& out) const;
 
 private:
 	// 1イベントを全粒子に適用する(相手手はサンプリング＋分岐)
@@ -130,6 +142,19 @@ private:
 	Move sample_policy(Particle& p, const std::vector<Move>& moves,
 	                   const std::vector<Move>& exclude, PRNG& rng);
 
+	// --- §2 SIR(cfg_.sir=1 のときだけ使う) ---
+	// 相手の反則の尤度: P(反則 | 粒子) = 1 − p_ok。p_ok は「相手の意図
+	// (相手視界での指したい手)のうち粒子上で合法な質量」で、探索の相手ノード
+	// (dsearch の opp_node)と同じ量・同じ重み付け(softmax+ε一様)。
+	double opp_foul_likelihood(const Particle& p) const;
+	// 相手の着手の尤度: 粒子の合法手の方策質量のうち、観測(取られたマス・
+	// 王手宣言)と整合する手が占める割合。consistent は consistent_opp_moves の出力。
+	double opp_move_likelihood(const Particle& p, const std::vector<Move>& consistent) const;
+	// 重みの正規化(平均→1)と ESS 計測、ESS < 粒子数/2 なら系統的リサンプリング。
+	// sync の「全イベント適用後」に1回だけ呼ぶ(clone_of が cursor_ に依存するため、
+	// イベント適用の途中では呼べない)。
+	void weights_normalize_and_resample(const GameHistory& hist);
+
 	// この手番でこれまでに反則になった自分の手(履歴の末尾から導出)。
 	// 現局面に対する強い制約なので、合成粒子の棄却に使う。
 	std::vector<Move> curFouls_;
@@ -160,6 +185,7 @@ private:
 	size_t                   cursor_     = 0;  // histのうち適用済みイベント数
 	int                      relaxLevel_ = 0;  // 現在の粒子群の緩和レベル(観測指標)
 	double                   relaxMean_  = 0;  // 同上の連続値(反則コスト割増に使う)
+	double                   essLast_    = 0;  // §2 SIR: 直近syncのESS(診断)
 };
 
 } // namespace Tsuitate

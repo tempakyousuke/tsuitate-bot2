@@ -28,6 +28,11 @@ struct ArenaOptions {
 	Config   cfg;
 	Config   cfg2;
 	bool     verbose = false;
+	// §4 prior較正の教師データ(JSONL)の出力先。空なら出力しない。
+	// 1行 = 1決定(反則のやり直しも含む): 指した側の「意図の集合」の特徴量と、
+	// 実際に選ばれた手のindex。審判の完全情報から取るので、相手の観測に依らず
+	// 両者の実際の指し手が教師になる。
+	std::string dumpPath;
 };
 
 // 対戦を実行し、結果をstdoutへ出力する

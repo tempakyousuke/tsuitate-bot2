@@ -308,6 +308,30 @@ struct Config {
 	// stage2 の反復深化(d=2,4,6…)が同じ部分木を読み直すぶんが主な回収源。
 	// ワーカースレッドごとに 16MB(2^20エントリ)確保する。
 	int  tt             = 0;
+	// §4 prior較正: fast_policy_score の重み表を切り替える。
+	//   0 = 手書き(POLICY_W_HAND。従来と完全に同一)
+	//   1 = アリーナの完全情報(審判が知る両者の実際の指し手)に適合した重み
+	//       (POLICY_W_FIT)。**王手の反映(checkAware)も込みで較正している**ので、
+	//       priorFit=1 のときは oppCheckPrior の値によらず王手中のprior切り替えが
+	//       常に効く(適合データがそうやって作られているため)。
+	// prior は信念のフィルタ・再生成・合成、探索の相手ノード(oppmodel)、
+	// 妨害マップ、SIRの尤度のすべてで共有される急所なので、A/Bはこのフラグ1つで行う。
+	int  priorFit       = 0;
+	// §2 SIR: 相手の反則を粒子の尤度として使う重み付き粒子フィルタ。0で従来どおり
+	// (全粒子等重み。コード経路も完全に同一)。
+	//
+	// 相手が反則した ⟺ 相手の意図した手が真の盤で不正だった、なので
+	// P(相手の反則 | 粒子) = 1 − p_ok(粒子)(p_ok は探索の相手ノードと同じ量)。
+	// 相手が普通に指したときも尤度 ∝ 観測(取られたマス・王手宣言)と整合する手の
+	// 方策質量、が粒子ごとに違う。従来は棄却(0/1)しかできず、この弱い証拠を
+	// 捨てていた(相手の反則は「カウントのみ」)。
+	//   - 粒子に logw を持たせ、相手イベントごとに上の尤度を掛ける
+	//   - ESS = (Σw)²/Σw² が粒子数の半分を切ったら系統的リサンプリング
+	//   - think() の p_legal と評価粒子の選択は重みに比例した系統抽出になる
+	// 再生成・合成で入る新粒子は平均重み(=正規化後の1.0)で入る(既知の近似:
+	// リプレイは硬い制約(捕獲・王手宣言)しか見ないので、反則尤度ぶんの
+	// 重み差は再生成では復元されない)。
+	int  sir            = 0;
 	uint64_t seed       = 20260827;
 	int  logLevel       = 1;     // 0:silent 1:info 2:debug
 };
@@ -347,9 +371,75 @@ void enumerate_opp_intents(const Position& pos, Color opp, std::vector<OppIntent
 // 取りに来る/当たりを避ける」ことを前提にしていて構造的にバイアスがある。
 // さらにこちらは do_move も評価関数呼び出しも不要なので桁違いに速い。
 //
-// inCheck: 相手が王手を宣言されている状態か(cfg.oppCheckPrior=1 のときだけ使う)。
+// inCheck: 相手が王手を宣言されている状態か
+// (cfg.oppCheckPrior=1 または cfg.priorFit=1 のときだけ効く)。
 int fast_policy_score(const Position& pos, Color opp, Move m, bool inCheck,
                       const Config& cfg);
+
+// ---------------------------------------------------------------------------
+// §4 prior較正 — 重み表と特徴量
+// ---------------------------------------------------------------------------
+// fast_policy_score は 線形モデル score = Σ_k W[k]·φ_k(m) で、
+// 重みを名前付きの表(PolicyWeights)に、特徴量の定義を policy_features に集める。
+// 手書きの重み(POLICY_W_HAND、従来の値そのまま)と、アリーナの完全情報から
+// 適合した重み(POLICY_W_FIT)を cfg.priorFit で切り替える。
+//
+// **表と特徴量の並びは1対1**: fast_policy_score(手書きの高速な整数演算)と
+// policy_features(ダンプ・適合用)が食い違うと、オフラインで適合した重みが
+// 実行時と別のモデルになる。増減するときは PF_* / PolicyWeights /
+// fast_policy_score / checkpolicy(整合検査コマンド)を必ず同時に更新すること。
+struct PolicyWeights {
+	int center;                   // PF_CENTER: 中央志向 × (4 − |file(to)−5筋|)
+	int dropBase;                 // PF_DROP: 打ちの基礎(移動手に比べ少数派)
+	int dropCamp;                 // PF_DROP_CAMP: 敵陣(相手から見て4段目以内)への打ち
+	int dropCheck;                // PF_DROP_CHECK: 王手中の打ち(=当てずっぽうの合駒)
+	int push[PIECE_TYPE_NB];      // PF_PUSH+pt: 駒種ごとの前進したさ × adv(−2..3)
+	int promote;                  // PF_PROMOTE: 成り
+	int kingQuiet;                // PF_KING_QUIET: 平時の玉移動
+	int kingCheck;                // PF_KING_CHECK: 王手中の玉移動(逃げ)
+	int kingDist;                 // PF_KING_DIST: 着地マスと自玉の距離(玉以外の移動と打ち)。
+	                              // 手書きでは0=無効(0なら玉位置の参照ごと省く)
+};
+extern const PolicyWeights POLICY_W_HAND;  // 従来の手書きの値(挙動は完全に同一)
+extern const PolicyWeights POLICY_W_FIT;   // アリーナ教師データへの適合値(§4)
+
+// 特徴量のindex(policy_features の出力レイアウト)
+enum PolicyFeature {
+	PF_CENTER     = 0,
+	PF_DROP       = 1,
+	PF_DROP_CAMP  = 2,
+	PF_DROP_CHECK = 3,
+	PF_PUSH       = 4,                     // +pt で駒種スロット(16個)
+	PF_PROMOTE    = PF_PUSH + PIECE_TYPE_NB,   // 20
+	PF_KING_QUIET = PF_PROMOTE + 1,        // 21
+	PF_KING_CHECK = PF_PROMOTE + 2,        // 22
+	PF_KING_DIST  = PF_PROMOTE + 3,        // 23
+	PF_DIM        = PF_PROMOTE + 4,        // 24
+};
+
+// 重み表を特徴indexで引く(policy_features と同じレイアウト)。
+// checkpolicy(整合検査)とダンプ側の検算用。
+inline int policy_weight_at(const PolicyWeights& w, int k) {
+	switch (k) {
+	case PF_CENTER:     return w.center;
+	case PF_DROP:       return w.dropBase;
+	case PF_DROP_CAMP:  return w.dropCamp;
+	case PF_DROP_CHECK: return w.dropCheck;
+	case PF_PROMOTE:    return w.promote;
+	case PF_KING_QUIET: return w.kingQuiet;
+	case PF_KING_CHECK: return w.kingCheck;
+	case PF_KING_DIST:  return w.kingDist;
+	default:            return w.push[k - PF_PUSH];  // PF_PUSH .. PF_PUSH+15
+	}
+}
+
+// m の特徴量を phi[PF_DIM] に書く(全要素を上書きする)。
+// checkAware: 「王手されていることを指し手の好みに反映する」状態で評価するか
+// (fast_policy_score の inCheck && (oppCheckPrior || priorFit) に対応)。
+// 任意の重み表 W に対して Σ W[k]·φ[k] == fast_policy_score(同じ checkAware 設定)
+// が成り立つ(checkpolicy コマンドが検査する不変条件)。
+void policy_features(const Position& pos, Color side, Move m, bool checkAware,
+                     int8_t phi[PF_DIM]);
 
 // ---------------------------------------------------------------------------
 // 反則経済

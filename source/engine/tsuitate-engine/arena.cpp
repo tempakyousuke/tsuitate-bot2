@@ -5,6 +5,7 @@
 #if defined(TSUITATE_ENGINE)
 
 #include <algorithm>
+#include <fstream>
 #include <iostream>
 
 #include "../../movegen.h"
@@ -59,6 +60,7 @@ struct ArenaStats {
 	// 平均が反則率で重み付いてしまう。設定間で比べる指標はすべて手番単位で取る。
 	long long turns = 0;
 	long long particleSum = 0, zeroParticle = 0;
+	double    essSum = 0;  // §2 SIR: 実効サンプル数(sir=0では粒子数と同じ)
 	// 探索スループット(§3.1/§3.2の採用ゲート用)。決定ごとに集計する。
 	long long nodesSum = 0, thinkMsSum = 0, depthSum = 0;
 	double    pLegalSum = 0;     // 整数%で持つと二重に切り捨てて0.5pp沈むのでdoubleで持つ
@@ -81,6 +83,7 @@ struct ArenaStats {
 	void add_turn(const ThinkResult& r) {
 		turns++;
 		particleSum += r.nParticles;
+		essSum += r.ess;
 		pLegalSum += r.pLegal;
 		if (r.nParticles == 0)
 			zeroParticle++;
@@ -251,7 +254,52 @@ struct GameStat {
 	int plies = 0;
 };
 
-GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool verbose) {
+// §4 prior較正の教師データ(1決定=1行のJSONL)。
+// 指した側(mover)の「意図の集合」= enumerate_opp_intents(mover自身の駒だけを
+// 読む生成器)と、その特徴量(policy_features)、実際に選ばれた手のindexを書く。
+// 特徴量は mover の私有情報(自駒・自玉・王手宣言)だけに依存するので、
+// これはそのまま「相手モデルが観測できる条件付け」での教師になる。
+// chk は「王手中の決定」フラグ: 特徴は checkAware=王手中 で出すので、
+// 手書きprior(oppCheckPrior=0 相当)の対照log-lossを出すときは
+// オフライン側で PF_DROP_CHECK/PF_KING_CHECK を平時側に畳み直す。
+struct PolicyDump {
+	std::ofstream out;
+	long long     lines   = 0;
+	long long     misses  = 0;  // chosen が意図の集合に見つからなかった決定数
+	std::vector<OppIntent> intents;  // 再確保を避けるバッファ
+
+	void decision(const Position& pos, Move chosen, int game, const char* kind,
+	              const Config& cfg) {
+		const Color side    = pos.side_to_move();
+		const bool  inCheck = pos.in_check();
+		enumerate_opp_intents(pos, side, intents, inCheck, cfg);
+		int idx = -1;
+		for (size_t i = 0; i < intents.size(); ++i)
+			if (intents[i].m.raw() == chosen.raw()) { idx = int(i); break; }
+		if (idx < 0) {
+			// 意図 ⊇ 自分の候補手 のはずなので、ここに来たら生成器の食い違い。
+			// ここでは黙って数え、終了時に報告する(checkintents の系)。
+			++misses;
+			return;
+		}
+		out << "{\"g\":" << game << ",\"k\":\"" << kind << "\",\"chk\":" << (inCheck ? 1 : 0)
+		    << ",\"c\":" << idx << ",\"phi\":[";
+		int8_t phi[PF_DIM];
+		for (size_t i = 0; i < intents.size(); ++i) {
+			policy_features(pos, side, intents[i].m, /*checkAware=*/inCheck, phi);
+			out << (i ? ",[" : "[");
+			for (int k = 0; k < PF_DIM; ++k)
+				out << (k ? "," : "") << int(phi[k]);
+			out << "]";
+		}
+		out << "]}\n";
+		++lines;
+	}
+};
+
+GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool verbose,
+                  PolicyDump* dump = nullptr, int gameIdx = 0,
+                  const char* kindSente = "", const char* kindGote = "") {
 	GameStat stat;
 	Position pos;
 	std::deque<StateInfo> sts;
@@ -277,6 +325,11 @@ GameStat play_one(IPlayer& sente, IPlayer& gote, const ArenaOptions& opt, bool v
 		IPlayer* other = players[1 - side];
 
 		Move m = mover->choose();
+		// §4 教師データ: 決定(反則のやり直し込み)を審判の完全情報で記録する。
+		// mover が指せなかった(投了)場合は決定が存在しないので書かない。
+		if (dump && m != Move::none())
+			dump->decision(pos, m, gameIdx, side == 0 ? kindSente : kindGote,
+			               opt.cfg);
 		// 診断は choose() のあとに取る。信念の同期・再生成は think() の中で走るので、
 		// 先に取ると「相手の直前の手をまだ反映していない粒子」を今の真の盤と
 		// 比べることになり、この変更が効かせたい経路そのものを測り損ねる。
@@ -405,14 +458,28 @@ void run_arena(const ArenaOptions& opt) {
 	int otherGames = 0;                            // 手数切れ
 	TimePoint t0 = now();
 
+	// §4 prior較正の教師データダンプ(dump <path> 指定時のみ)
+	std::unique_ptr<PolicyDump> dump;
+	if (!opt.dumpPath.empty()) {
+		dump = std::make_unique<PolicyDump>();
+		dump->out.open(opt.dumpPath);
+		if (!dump->out) {
+			std::cout << "info string dump open failed: " << opt.dumpPath
+			          << " (ダンプなしで続行)" << std::endl;
+			dump.reset();
+		}
+	}
+
 	for (int g = 0; g < opt.games; ++g) {
 		uint64_t s1 = opt.seed + g * 2, s2 = opt.seed + g * 2 + 1;
 		auto     a  = make_player(opt.p1, opt, s1, 0);
 		auto     b  = make_player(opt.p2, opt, s2, 1);
 		// 先後を交互に入れ替える
 		bool p1Sente = (g % 2 == 0);
-		GameStat st  = p1Sente ? play_one(*a, *b, opt, opt.verbose)
-		                       : play_one(*b, *a, opt, opt.verbose);
+		const char* kS = (p1Sente ? opt.p1 : opt.p2).c_str();
+		const char* kG = (p1Sente ? opt.p2 : opt.p1).c_str();
+		GameStat st  = p1Sente ? play_one(*a, *b, opt, opt.verbose, dump.get(), g, kS, kG)
+		                       : play_one(*b, *a, opt, opt.verbose, dump.get(), g, kS, kG);
 		int p1Side = p1Sente ? 0 : 1;
 		const bool p1Won = st.winner == p1Side;
 		if (st.winner == -1)
@@ -477,6 +544,9 @@ void run_arena(const ArenaOptions& opt) {
 		std::cout << "  belief diag[" << (k == 0 ? opt.p1 : opt.p2) << "#" << (k + 1) << "]:"
 		          << " turns=" << g.turns << " decisions=" << g.decisions
 		          << " avg_particles=" << (double(g.particleSum) / T)
+		          // §2 SIR の縮退診断。ESS は再生成で人口が回復する**前**に測るので、
+		          // sir=0 でも avg_particles(think後の粒子数)より低く出うる
+		          << " avg_ess=" << (g.essSum / T)
 		          << " relax(0/1/2/synth)=" << g.relaxHist[0] << "/" << g.relaxHist[1]
 		          << "/" << g.relaxHist[2] << "/" << g.relaxHist[3]
 		          << " zero_particle=" << g.zeroParticle
@@ -502,6 +572,11 @@ void run_arena(const ArenaOptions& opt) {
 			          << " brier_n=" << g.brierSamples;
 		std::cout << std::endl;
 	}
+	if (dump)
+		std::cout << "  policy dump: " << opt.dumpPath << " lines=" << dump->lines
+		          << " missing_chosen=" << dump->misses
+		          << (dump->misses ? "  (意図の集合に選択手が無い決定あり — 生成器の食い違い)"
+		                           : "") << std::endl;
 	g_stats[0] = ArenaStats();
 	g_stats[1] = ArenaStats();
 }

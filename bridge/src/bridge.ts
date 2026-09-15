@@ -69,16 +69,31 @@ type MoveAck =
 // ---------------------------------------------------------------------------
 // エンジン子プロセス
 // ---------------------------------------------------------------------------
+// エンジンが落ちても(稀なセグフォルトを実測済み。docs/strengthening.md 2.5章)
+// botを止めない: 子プロセスを再起動し、進行中の対局は観測イベントの
+// リプレイで復元する。エンジンの対局状態は `new` 以降に送った行が全量なので、
+// それを gameLog として持っておけば新しいプロセスに流し直すだけで復元できる
+// (思考は go のたびに信念から立て直すので、置換表等の喪失は1手ぶんの損で済む)。
 class Engine {
-	private proc: ChildProcessByStdio<Writable, Readable, null>;
-	private waiters: ((line: string) => boolean)[] = [];
+	private proc!: ChildProcessByStdio<Writable, Readable, null>;
+	private waiters: { onLine: (line: string) => boolean; onFail: (err: Error) => void }[] = [];
+	private alive = false;
+	private shuttingDown = false;
+	private restartTimes: number[] = [];
 
-	constructor(path: string) {
-		this.proc = spawn(path, [], { stdio: ['pipe', 'pipe', 'inherit'] });
-		this.proc.on('exit', (code) => {
-			console.error(`エンジンが終了しました (code=${code})`);
-			process.exit(1);
-		});
+	/** 再起動のたびに呼ばれる(初回spawn直後にも)。set系の設定を送る側が登録する */
+	onSpawn: (() => void) | null = null;
+	/** 再起動が完了したときに呼ばれる(対局リプレイ後の思考再開などに使う) */
+	onRestart: (() => void) | null = null;
+
+	constructor(private path: string) {
+		this.spawn();
+	}
+
+	private spawn(): void {
+		this.proc = spawn(this.path, [], { stdio: ['pipe', 'pipe', 'inherit'] });
+		this.alive = true;
+		this.proc.on('exit', (code, signal) => this.handleExit(code, signal));
 		const rl = createInterface({ input: this.proc.stdout });
 		rl.on('line', (line) => {
 			if (line.startsWith('info')) {
@@ -86,23 +101,60 @@ class Engine {
 				return;
 			}
 			// bestmove などの応答を待っているwaiterへ渡す
-			this.waiters = this.waiters.filter((w) => !w(line));
+			this.waiters = this.waiters.filter((w) => !w.onLine(line));
 		});
 	}
 
+	private handleExit(code: number | null, signal: string | null): void {
+		this.alive = false;
+		if (this.shuttingDown) return;
+		console.error(`エンジンが終了しました (code=${code} signal=${signal})。再起動します`);
+		// 待っている応答は来ない。待ち側(think)へ失敗を返して状態を解いてもらう
+		const pend = this.waiters;
+		this.waiters = [];
+		for (const w of pend) w.onFail(new Error('engine died'));
+		// クラッシュループの安全弁: 10分間に5回落ちたら異常とみなして止まる
+		// (壊れたバイナリ・設定ミスで無限に再起動し続けない)
+		const now = Date.now();
+		this.restartTimes = this.restartTimes.filter((t) => now - t < 600_000);
+		this.restartTimes.push(now);
+		if (this.restartTimes.length > 5) {
+			console.error('エンジンが10分間に5回以上落ちました。再起動を諦めます');
+			process.exit(1);
+		}
+		setTimeout(() => {
+			this.spawn();
+			this.onSpawn?.();
+			this.onRestart?.();
+		}, 500);
+	}
+
+	/** 意図した終了(SIGINT)。exitハンドラの再起動を抑止する */
+	shutdown(): void {
+		this.shuttingDown = true;
+		this.send('quit');
+	}
+
 	send(line: string): void {
+		if (!this.alive) return; // 死んでいる間の送信は捨てる(再起動側がリプレイする)
 		this.proc.stdin.write(line + '\n');
 	}
 
-	/** prefixで始まる次の行を待つ */
+	/** prefixで始まる次の行を待つ。エンジンが落ちたら失敗する */
 	wait(prefix: string, timeoutMs = 120_000): Promise<string> {
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => reject(new Error(`engine timeout: ${prefix}`)), timeoutMs);
-			this.waiters.push((line) => {
-				if (!line.startsWith(prefix)) return false;
-				clearTimeout(timer);
-				resolve(line);
-				return true;
+			this.waiters.push({
+				onLine: (line) => {
+					if (!line.startsWith(prefix)) return false;
+					clearTimeout(timer);
+					resolve(line);
+					return true;
+				},
+				onFail: (err) => {
+					clearTimeout(timer);
+					reject(err);
+				},
 			});
 		});
 	}
@@ -130,8 +182,9 @@ for (const raw of engineOptions.split(',')) {
 }
 
 const engine = new Engine(enginePath);
-engine.send('usi');
 
+// 起動時設定。再起動のたびに送り直す必要があるので関数にまとめて onSpawn へ登録する。
+//
 // 既定でCPUぶんのワーカースレッドを使う(§3.1 粒子並列。4コアで実効3.8倍)。
 // `threads 0` = auto で、使えるCPU数の判定(ハードウェア並列度・cgroupクォータ・
 // 上限16)は**エンジン側**の effective_threads がすべて行う。ブリッジで数えると
@@ -139,8 +192,32 @@ engine.send('usi');
 // syncpct の auto 解決(実効スレッド数>1 なら 55 —— 探索だけ並列化すると
 // 反則経済が崩れる較正知識、docs/strengthening.md 3.4章)も同様にエンジン側。
 // エンジンは対局開始時に実効値を info 行で報告する。
-if (!engineOptMap.has('threads')) engine.send('set threads 0');
-for (const [k, v] of engineOptMap) engine.send(`set ${k} ${v}`.trimEnd());
+function configureEngine(): void {
+	engine.send('usi');
+	if (!engineOptMap.has('threads')) engine.send('set threads 0');
+	for (const [k, v] of engineOptMap) engine.send(`set ${k} ${v}`.trimEnd());
+}
+engine.onSpawn = configureEngine;
+configureEngine();
+
+// 対局状態を作る行の全量(`new` から現在まで)。エンジンが落ちたとき、
+// 新しいプロセスへこれを流し直すだけで対局状態が復元できる。
+// go は状態を作らない(思考のトリガ)ので記録しない。
+let gameLog: string[] = [];
+
+/** 対局状態を変えるコマンドはこちらで送る(リプレイ用に記録される) */
+function sendGame(line: string): void {
+	gameLog.push(line);
+	engine.send(line);
+}
+
+engine.onRestart = () => {
+	if (!gameId) return;
+	console.log(`対局状態をリプレイします (${gameLog.length}行)`);
+	for (const line of gameLog) engine.send(line);
+	// 手番かどうかは think() が game:sync で確かめるので、無条件に起こしてよい
+	scheduleThink(500);
+};
 
 // ---------------------------------------------------------------------------
 // Socket.IO 接続と対局ループ
@@ -225,7 +302,7 @@ async function think(): Promise<void> {
 			} else if (ack.reason === 'foul') {
 				console.log(`反則: ${usi} (累計${ack.foulCount})`);
 				record('foul', { usi, foulCount: ack.foulCount });
-				engine.send(`foul ${usi}`);
+				sendGame(`foul ${usi}`);
 				scheduleThink(100);
 			} else {
 				console.error(`着手エラー: ${ack.error}`);
@@ -261,7 +338,8 @@ socket.on('match:found', (payload: { gameId: string; yourColor: Color }) => {
 	gameId = payload.gameId;
 	myColor = payload.yourColor;
 	lastSentUsi = null;
-	engine.send(`new ${myColor}`);
+	gameLog = [];  // 前局のリプレイログを持ち越さない
+	sendGame(`new ${myColor}`);
 	record('matchFound', payload);
 	console.log(`マッチ成立: ${myColor} 番 (gameId=${payload.gameId})`);
 });
@@ -271,14 +349,14 @@ socket.on('game:state', () => scheduleThink(thinkDelayMs));
 socket.on('game:moveAccepted', (payload: { captured?: string }) => {
 	record('moveAccepted', { usi: lastSentUsi, ...payload });
 	if (lastSentUsi) {
-		engine.send(`moveok ${lastSentUsi}` + (payload.captured ? ` cap ${payload.captured}` : ''));
+		sendGame(`moveok ${lastSentUsi}` + (payload.captured ? ` cap ${payload.captured}` : ''));
 		lastSentUsi = null;
 	}
 });
 
 socket.on('game:opponentMoved', (payload: { capturedYourPieceAt?: string }) => {
 	record('opponentMoved', payload);
-	engine.send(
+	sendGame(
 		'oppmove' + (payload.capturedYourPieceAt ? ` cap ${payload.capturedYourPieceAt}` : '')
 	);
 	scheduleThink(thinkDelayMs);
@@ -290,12 +368,12 @@ socket.on('game:foul', () => {
 
 socket.on('game:opponentFoul', (payload: { opponentFoulCount: number }) => {
 	record('opponentFoul', payload);
-	engine.send('oppfoul');
+	sendGame('oppfoul');
 });
 
 socket.on('game:check', (payload: { inCheck: Color }) => {
 	record('check', payload);
-	engine.send(`check ${payload.inCheck === myColor ? 'you' : 'opp'}`);
+	sendGame(`check ${payload.inCheck === myColor ? 'you' : 'opp'}`);
 });
 
 socket.on('game:end', (payload: any) => {
@@ -306,6 +384,7 @@ socket.on('game:end', (payload: any) => {
 	);
 	gameId = null;
 	lastSentUsi = null;
+	gameLog = [];
 	if (thinkTimer) clearTimeout(thinkTimer);
 	setTimeout(joinQueue, 3000);
 });
@@ -317,7 +396,7 @@ socket.on('queue:closed', (payload: { reason: string }) => {
 
 process.on('SIGINT', () => {
 	console.log('終了します');
-	engine.send('quit');
+	engine.shutdown();
 	socket.close();
 	process.exit(0);
 });
