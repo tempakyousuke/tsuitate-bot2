@@ -76,6 +76,10 @@ struct ArenaStats {
 	// 9.5章: 信念が不正として捨てた粒子(局ごとの累計の差分を choose で足す)と
 	// 探索ジョブのガードで飛ばしたジョブ。側ごとに帰属する
 	long long badAdvance = 0, badJobs = 0;
+	// 探索まで進んだ決定数(候補があり粒子もあった決定)。スケジューリング診断
+	// (depth_hist / avg_cands / ms 内訳など)の分母。投了・粒子ゼロの決定は
+	// 「stage2 に入れなかった」ではなく「探索していない」なので混ぜない
+	long long searched = 0;
 	double    pLegalSum = 0;     // 整数%で持つと二重に切り捨てて0.5pp沈むのでdoubleで持つ
 	long long relaxHist[4] = {};  // 緩和レベル別の手番数(3=合成粒子)
 	double    kingAccSum = 0, occAccSum = 0;
@@ -92,11 +96,16 @@ struct ArenaStats {
 		nodesSum   += (long long) r.nodes;
 		thinkMsSum += (long long) r.elapsedMs;
 		depthSum   += r.depthReached;
+		badAdvance += r.badAdvance;
+		badJobs    += (long long) r.badJobs;
+		syncMsSum  += (long long) r.syncMs;
+		if (r.cands == 0)
+			return;  // 探索していない決定(投了・粒子ゼロ)。以下の分母には入れない
+		searched++;
 		depthHist[std::clamp(r.depthReached, 0, 7)]++;
 		jobs2       += (long long) r.jobs2;
 		trunc2      += (long long) r.trunc2;
 		gateSkipped += r.gateSkipped;
-		syncMsSum   += (long long) r.syncMs;
 		stage1MsSum += (long long) r.stage1Ms;
 		stage2MsSum += (long long) r.stage2Ms;
 		candsSum    += (long long) r.cands;
@@ -130,18 +139,11 @@ struct BeliefPlayer : IPlayer {
 	    : cfg(c), budgetMs(budget), slot(slot_) {}
 
 	ThinkResult lastResult;
-	long long   lastBadAdvance = 0;  // 直前の決定時点の Belief::bad_advance(対局内累計)
 
-	void new_game(Color us) override {
-		core.new_game(us, cfg);
-		lastBadAdvance = 0;
-	}
+	void new_game(Color us) override { core.new_game(us, cfg); }
 	Move choose() override {
 		ThinkResult r = core.think(budgetMs);
 		g_stats[slot].add_decision(r);
-		g_stats[slot].badAdvance += r.badAdvance - lastBadAdvance;
-		g_stats[slot].badJobs    += (long long) r.badJobs;
-		lastBadAdvance = r.badAdvance;
 		const Move best = r.best;
 		lastResult = std::move(r);
 		return best;
@@ -601,32 +603,33 @@ void run_arena(const ArenaOptions& opt) {
 		// §9 stage2 スケジューリング診断。depth_hist は完了深さ 0..6 の決定数と 7+。
 		// trunc2 は「stage2 のジョブのうちノード上限で値が汚れた割合」で、
 		// avg_depth が同じでも読めている中身が違うことを検出する。
-		std::cout << " depth_hist=";
+		// §9 stage2 スケジューリング診断(分母は探索まで進んだ決定 searched=)。
+		// depth_hist は完了深さ 0..6 の決定数と 7+。trunc2 は「stage2 のジョブのうち
+		// ノード上限で値が汚れた割合」で、avg_depth が同じでも読めている中身が違う
+		// ことを検出する。pass_ms は深さ別のパス平均所要時間(ms、passgrowth の目安)
+		const double S = double(std::max<long long>(1, g.searched));
+		std::vector<std::string> dh, pm;
 		for (int d = 0; d < 8; ++d)
-			std::cout << (d ? "/" : "") << g.depthHist[d];
-		std::cout << " trunc2=" << (g.jobs2 > 0 ? 100.0 * double(g.trunc2) / double(g.jobs2) : 0.0)
+			dh.push_back(std::to_string(g.depthHist[d]));
+		for (int d = 0; d < 8; ++d)
+			if (g.passCnt[d])
+				pm.push_back(std::to_string(d) + ":"
+				             + std::to_string(double(g.passMsSum[d]) / double(g.passCnt[d]))
+				             + "(n=" + std::to_string(g.passCnt[d]) + ")");
+		std::cout << " searched=" << g.searched
+		          << " depth_hist=" << StringExtension::Join(dh, "/")
+		          << " trunc2=" << (g.jobs2 > 0 ? 100.0 * double(g.trunc2) / double(g.jobs2) : 0.0)
 		          << "%(" << g.trunc2 << "/" << g.jobs2 << ")"
-		          << " gate_skip=" << g.gateSkipped;
-		// 深さ別のパス平均所要時間(ms)。passgrowth = 隣り合う深さの比、が目安
-		std::cout << " pass_ms=";
-		bool first = true;
-		for (int d = 0; d < 8; ++d)
-			if (g.passCnt[d]) {
-				std::cout << (first ? "" : ",") << d << ":"
-				          << (double(g.passMsSum[d]) / double(g.passCnt[d]))
-				          << "(n=" << g.passCnt[d] << ")";
-				first = false;
-			}
-		if (first)
-			std::cout << "-";
-		// 予算の内訳(決定あたり平均ms)。sync が締め切りいっぱいまで使うと
-		// stage2 に残る時間が構造的に決まる
-		std::cout << " bad_advance=" << g.badAdvance << " bad_jobs=" << g.badJobs
+		          << " gate_skip=" << g.gateSkipped
+		          << " pass_ms=" << (pm.empty() ? std::string("-") : StringExtension::Join(pm, ","))
+		          // 9.5章: 側ごとの異常件数(信念が捨てた粒子 / ガードで飛ばしたジョブ)
+		          << " bad_advance=" << g.badAdvance << " bad_jobs=" << g.badJobs
+		          // 予算の内訳(決定あたり平均ms。sync は全決定、s1/s2 は探索した決定)。
+		          // sync には破産時の作り直しも含む
 		          << " ms(sync/s1/s2)=" << (double(g.syncMsSum) / double(g.decisions))
-		          << "/" << (double(g.stage1MsSum) / double(g.decisions))
-		          << "/" << (double(g.stage2MsSum) / double(g.decisions))
+		          << "/" << (double(g.stage1MsSum) / S) << "/" << (double(g.stage2MsSum) / S)
 		          // 候補数と stage1 の1候補あたり粒子数(stage1pct の効き方を見る)
-		          << " avg_cands=" << (double(g.candsSum) / double(g.decisions))
+		          << " avg_cands=" << (double(g.candsSum) / S)
 		          << " avg_k1=" << (g.candsSum > 0 ? double(g.jobs1Sum) / double(g.candsSum) : 0.0);
 		if (g.truthSamples)
 			std::cout << " king_acc=" << (100.0 * g.kingAccSum / double(g.truthSamples)) << "%"

@@ -45,8 +45,8 @@ struct ThinkResult {
 	// 候補手の数と stage1 のジョブ数(候補×粒子)。stage1 の重さの診断
 	size_t      cands = 0;
 	uint64_t    jobs1 = 0;
-	// 9.5章の診断: 信念が不正として捨てた粒子の累計(対局内。Belief::bad_advance)と、
-	// 探索ジョブの合法性ガードで飛ばしたジョブ数(この決定)
+	// 9.5章の診断(どちらも**この決定**の回数): 信念の同期が不正として捨てた粒子と、
+	// 探索ジョブのガード(粒子の局面が scan 時点から変わっていた)で飛ばしたジョブ
 	long long   badAdvance = 0;
 	uint64_t    badJobs = 0;
 

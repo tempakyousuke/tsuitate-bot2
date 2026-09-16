@@ -473,7 +473,7 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 	// nodesLimit を超えた探索は途中で静的評価を返しており値が汚れているので書かない。
 	// 置換は「同世代でより深い既存エントリ」だけを尊重し、それ以外は上書きする
 	// (旧世代はどれだけ深くても置き換え対象。世代が違う値はカットオフに使えないため)。
-	if (ctx && nodes <= nodesLimit) {
+	if (ctx && !truncated()) {
 		const bool keep = tte->key == pos.key() && tte->gen == ctx->gen
 		                  && tte->depth > depth;
 		if (!keep) {

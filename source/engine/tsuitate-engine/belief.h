@@ -84,11 +84,13 @@ struct Particle {
 
 using ParticlePtr = std::unique_ptr<Particle>;
 
-// 「この局面で不正な手を進めようとした」を stderr に記録する(原因調査用。
-// where = 呼び出し元の名前)。プロセス全体で最初の 20 件だけ出す
-// (大量に出ても原因調査には役立たず、アリーナの出力を埋めるだけ)。
-// 回数の集計は呼び出し側(Belief::badAdvance_ / ThinkResult::badJobs)が持ち、
-// 対局・側ごとに帰属できるようにする。
+// 異常(不正な手・親と一致しない複製など)の記録枠。プロセス全体で最初の 20 件
+// だけ true を返す(大量に出ても原因調査には役立たず、出力を埋めるだけ)。
+// 記録は他の診断と同じく `info string`(sync_cout)で出す。回数の集計は
+// 呼び出し側(Belief::badAdvance_ / ThinkResult::badJobs)が持ち、対局・側ごとに
+// 帰属できるようにする。
+bool anomaly_report_slot();
+// 「この局面で不正な手を進めようとした」の記録(where = 呼び出し元の名前)
 void report_illegal_move(const Position& pos, Move m, const char* where);
 
 class Belief {

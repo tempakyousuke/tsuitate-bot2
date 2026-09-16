@@ -15,11 +15,18 @@
 namespace YaneuraOu {
 namespace Tsuitate {
 
-void report_illegal_move(const Position& pos, Move m, const char* where) {
+bool anomaly_report_slot() {
 	static std::atomic<int> printed{0};
-	if (printed.fetch_add(1) < 20)
-		fprintf(stderr, "tsuitate: ILLEGAL MOVE in %s: move=%s sfen=%s\n", where,
-		        to_usi_string(m).c_str(), pos.sfen().c_str());
+	// 上限に達した後は素の load だけ(ワーカーが同じキャッシュ行を取り合わない)
+	if (printed.load(std::memory_order_relaxed) >= 20)
+		return false;
+	return printed.fetch_add(1, std::memory_order_relaxed) < 20;
+}
+
+void report_illegal_move(const Position& pos, Move m, const char* where) {
+	if (anomaly_report_slot())
+		sync_cout << "info string ILLEGAL MOVE in " << where << ": move=" << to_usi_string(m)
+		          << " sfen=" << pos.sfen() << sync_endl;
 }
 
 void Belief::reset(Color us, const Config& cfg) {
@@ -247,8 +254,9 @@ ParticlePtr Belief::clone_of(const GameHistory& hist, const Particle& src) {
 			}
 		} else if (ev.kind == EvKind::OppMove) {
 			if (k >= src.oppMoves.size()) {
-				fprintf(stderr, "tsuitate: clone_of: oppMoves too short (%zu) at event %zu/%zu\n",
-				        src.oppMoves.size(), i, cursor_);
+				if (anomaly_report_slot())
+					sync_cout << "info string clone_of: oppMoves too short (" << src.oppMoves.size()
+					          << ") at event " << i << "/" << cursor_ << sync_endl;
 				++badAdvance_;
 				return nullptr;
 			}
@@ -262,10 +270,10 @@ ParticlePtr Belief::clone_of(const GameHistory& hist, const Particle& src) {
 		}
 	}
 	if (p->pos.key() != src.pos.key()) {
-		static std::atomic<int> printed{0};
-		if (printed.fetch_add(1) < 20)
-			fprintf(stderr, "tsuitate: clone_of: replica != parent (oppMoves=%zu/%zu)\n  parent=%s\n  child =%s\n",
-			        k, src.oppMoves.size(), src.pos.sfen().c_str(), p->pos.sfen().c_str());
+		if (anomaly_report_slot())
+			sync_cout << "info string clone_of: replica != parent (oppMoves=" << k << "/"
+			          << src.oppMoves.size() << ") parent=" << src.pos.sfen()
+			          << " child=" << p->pos.sfen() << sync_endl;
 		++badAdvance_;
 		return nullptr;
 	}
@@ -336,6 +344,7 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 			ParticlePtr        p;
 			std::vector<Move>  moves;
 			Move               chosen;
+			bool               cloneFailed = false;  // 複製に失敗した親は再試行しない
 		};
 		std::vector<Pending> pend;
 		std::vector<Move>    buf;
@@ -372,18 +381,21 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 		size_t idx = 0;
 		while (budget > 0 && !pend.empty()) {
 			Pending& pd = pend[idx % pend.size()];
-			if (!pd.p->synthetic && pd.moves.size() >= 2) {
+			if (!pd.p->synthetic && !pd.cloneFailed && pd.moves.size() >= 2) {
 				std::vector<Move> excl = {pd.chosen};
 				Move alt = sample_policy(*pd.p, pd.moves, excl, rng_);
 				if (alt != Move::none()) {
 					// alt は親の整合手(合法)で、複製は親と一致することを clone_of が
-					// 保証するので、子でも合法。複製に失敗した親は budget を消費しない
-					// (試行回数は下の idx の上限で抑える)
+					// 保証するので、子でも合法。複製に失敗した親(履歴が壊れている)は
+					// 二度と試さない: 失敗は cursor_ 手ぶんのリプレイを丸ごと捨てるので、
+					// 同じ親を4周ぶん繰り返すと sync の締め切りを食い潰す
 					if (auto child = clone_of(hist, *pd.p)) {
 						child->oppMoves.push_back(alt);
 						child->advance(alt);
 						next.push_back(std::move(child));
 						--budget;
+					} else {
+						pd.cloneFailed = true;
 					}
 				} else {
 					// 代替手がない親はスキップ
