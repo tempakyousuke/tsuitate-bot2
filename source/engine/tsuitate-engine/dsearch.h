@@ -36,12 +36,14 @@ namespace Tsuitate {
 //  相手ノードは TT を通らないので ply 依存の反則項は混入しない)。
 // gen は置換の老化(同一thinkのエントリを深さ優先で守る)にだけ使う。
 //
-// 既知のトレードオフ(tt > 0 かつ threads > 1 のとき): TT/history はワーカー
-// ローカルで、粒子グループ→ワーカーの割当は atomic カウンタの動的スケジュール
-// なので、**ジョブの評価値自体が「どのワーカーが先にどのグループを取ったか」に
-// 依存する**。think() の固定順還元は加算順しか固定しないため、tt を有効にすると
-// 同一 seed でも実行ごとに選ぶ手が変わりうる(seed からの再現デバッグが不能)。
-// 実験フラグとして許容している。再現性が要るなら割当を静的(g % nw)にすること。
+// 既知のトレードオフ(コンテキストあり = hist(既定オン)または tt、かつ threads > 1
+// のとき): TT/history はワーカーローカルで、粒子グループ→ワーカーの割当は atomic
+// カウンタの動的スケジュールなので、**ジョブの評価値自体が「どのワーカーが先に
+// どのグループを取ったか」に依存する**。think() の固定順還元は加算順しか固定しない
+// ため、同一 seed でも実行ごとに選ぶ手が変わりうる(seed からの再現デバッグが不能)。
+// §10 で hist を既定にしたので、これは既定の挙動でもある(時間門があるので
+// 完全な再現性はもともと無い)。再現性が要るなら `hist 0` にするか、
+// 割当を静的(g % nw)にすること。
 struct TTEntry {
 	uint64_t key   = 0;  // pos.key()(0 = 空きスロット)
 	int16_t  value = 0;  // value_to_tt 済み(詰みはply補正済み)
@@ -57,6 +59,8 @@ struct SearchContext {
 	static constexpr size_t TT_BITS = 20;                  // 2^20 = 1M エントリ(16MB)
 	static constexpr int    HIST_MAX = 16384;              // history の飽和値
 	std::vector<TTEntry> tt;
+	// false なら表を確保せず、killer/history のオーダリングだけを使う(Config::hist)
+	bool useTT = true;
 	// history[手番(0=BLACK)][Move::raw()]。quietの beta カットで depth^2 を加点
 	std::vector<int16_t> hist;
 	// killer もここに置く(ワーカーごと・think ごとにクリア)。DSearch のメンバに
@@ -81,14 +85,17 @@ struct SearchContext {
 	// oppFouls: 現在の相手反則累計(値カットオフのゲートに使う)
 	void begin_think(int oppFouls) {
 		curOppFouls = uint8_t(std::clamp(oppFouls, 0, 255));
-		if (tt.empty()) {
-			tt.resize(size_t(1) << TT_BITS);
+		if (hist.empty()) {
 			hist.assign(2 * 65536, 0);
 		} else {
 			++gen;
 			for (auto& h : hist)
 				h = int16_t(h / 2);
 		}
+		// 表は「使うと決まった最初の think」で確保する。useTT は手番ごとに変わりうる
+		// (tt=auto は予算で決まる)ので、初回に不要でも後で要ることがある
+		if (useTT && tt.empty())
+			tt.resize(size_t(1) << TT_BITS);
 		for (int p = 0; p < MAX_PLY; ++p)
 			killer[p][0] = killer[p][1] = Move::none();
 	}
@@ -119,8 +126,9 @@ struct DSearch {
 	double        foulGain = 0.0;
 	int           oppK1    = 0;
 
-	// --- §3.2 置換表 + オーダリング(cfg->tt != 0 のときだけ think() が設定する) ---
+	// --- §3.2 置換表 + オーダリング(hist / tt が有効なときだけ think() が設定する) ---
 	// nullptr なら従来の探索(MVV-LVAのみ)と完全に同一の経路。
+	// ctx->useTT が false のときは表を引かず、killer/history のオーダリングだけ使う。
 	// killer は ctx 側(ワーカーごと、think ごとにクリア)。
 	SearchContext* ctx = nullptr;
 

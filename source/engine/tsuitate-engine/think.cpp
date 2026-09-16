@@ -278,17 +278,23 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	// (全ワーカー分のゼロ初期化と first-touch を1スレッドに直列に乗せない)。
 	const int nWorkers = effective_threads(cfg);
 	++thinkStamp_;
-	if (cfg.tt)
+	// tt の解決(-1 = auto: この手の予算が ttAutoMs 以上なら表を使う。Config 参照)。
+	// hist だけのときは表を確保しない(useTT=false)。useTT は手番ごとに変わりうる
+	// ので begin_think の前に毎回セットする(表の確保は SearchContext 側が初回だけ行う)
+	const bool useTT  = cfg.tt > 0 || (cfg.tt < 0 && budgetMs >= cfg.ttAutoMs);
+	const bool useCtx = useTT || cfg.hist;
+	if (useCtx)
 		while (int(ctx_.size()) < nWorkers)
 			ctx_.push_back(std::make_unique<SearchContext>());
 	auto ctx_for = [&](int w) -> SearchContext* {
-		if (!cfg.tt)
+		if (!useCtx)
 			return nullptr;
 		SearchContext* c = ctx_[size_t(w)].get();
 		// コンテキストは1リージョン内では担当ワーカーだけが触り、リージョン間は
 		// run_workers の join が順序づけるので、素の比較で足りる(競合しない)。
 		if (c->stamp != thinkStamp_) {
 			c->stamp = thinkStamp_;
+			c->useTT = useTT;
 			c->begin_think(view.oppFouls);
 		}
 		return c;
@@ -665,7 +671,12 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	// 従来と同一: 予算の60%を過ぎていたら次のパスを始めず、毎パス同じ候補集合を
 	// stage2Samples 粒子で読み直す。
 	const int      step        = cfg.depthStep;              // 1..2(set_config_key が保証)
-	const uint64_t nodesLimit2 = uint64_t(cfg.nodesLimit2);
+	// 1ジョブのノード上限。予算に比例した上限(Config::nodesLimitPct)と固定上限の
+	// 大きいほう。NODES_PER_MS は1スレッドの実測 nps の目安(bench で 5〜6M nps)
+	constexpr double NODES_PER_MS = 5000.0;
+	const uint64_t nodesLimit2 = std::max<uint64_t>(
+	    uint64_t(cfg.nodesLimit2),
+	    uint64_t(double(budgetMs) * cfg.nodesLimitPct / 100.0 * NODES_PER_MS));
 	TimePoint      lastPassMs  = 0;  // 直前に完走したパスの所要時間
 	uint64_t       lastPassJobs = 0; // そのジョブ数
 	// この深さの1ジョブあたり wall 時間の推定(ms)。
