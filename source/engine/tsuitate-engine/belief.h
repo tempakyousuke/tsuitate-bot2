@@ -60,9 +60,20 @@ struct Particle {
 		return !pos.set(sfen, &sts.back()).has_value();
 	}
 
+	// 手を進める。呼び出し側がこの局面での合法性を検査済みであること
+	// (apply_event / replay_one はすべて直前に legal / 整合フィルタを通している)。
 	void advance(Move m) {
 		sts.emplace_back();
 		pos.do_move(m, sts.back());
+	}
+	// 合法性を確かめてから進める。不正なら適用せず false。
+	// 唯一の未検査経路だった clone_of(親の oppMoves 列をそのまま進める)が使う。
+	// 不正な手を do_move に渡すと segfault する(docs/strengthening.md 9.5章)。
+	bool try_advance(Move m) {
+		if (!legal(m))
+			return false;
+		advance(m);
+		return true;
 	}
 
 	// この粒子上でmが(通常将棋ルールで)合法か
@@ -72,6 +83,15 @@ struct Particle {
 };
 
 using ParticlePtr = std::unique_ptr<Particle>;
+
+// 異常(不正な手・親と一致しない複製など)の記録枠。プロセス全体で最初の 20 件
+// だけ true を返す(大量に出ても原因調査には役立たず、出力を埋めるだけ)。
+// 記録は他の診断と同じく `info string`(sync_cout)で出す。回数の集計は
+// 呼び出し側(Belief::badAdvance_ / ThinkResult::badJobs)が持ち、対局・側ごとに
+// 帰属できるようにする。
+bool anomaly_report_slot();
+// 「この局面で不正な手を進めようとした」の記録(where = 呼び出し元の名前)
+void report_illegal_move(const Position& pos, Move m, const char* where);
 
 class Belief {
 public:
@@ -98,6 +118,8 @@ public:
 	// §2 SIR: この同期で観測(相手イベント)を効かせた直後の実効サンプル数
 	// (リサンプリング前に測る。sir=0 なら常に粒子数と同じ)。診断用。
 	double ess() const { return essLast_; }
+	// この対局で「不正な手・親と一致しない複製」として捨てた回数(9.5章の診断)
+	long long bad_advance() const { return badAdvance_; }
 	// §2 SIR: 正規化した重み(合計 = 粒子数。等重みなら全要素1.0)。
 	// think() の p_legal と評価粒子の選択が使う。sir=0 では全要素1.0。
 	void normalized_weights(std::vector<double>& out) const;
@@ -186,6 +208,7 @@ private:
 	int                      relaxLevel_ = 0;  // 現在の粒子群の緩和レベル(観測指標)
 	double                   relaxMean_  = 0;  // 同上の連続値(反則コスト割増に使う)
 	double                   essLast_    = 0;  // §2 SIR: 直近syncのESS(診断)
+	long long                badAdvance_ = 0;  // 9.5章: 不正として捨てた粒子の数(対局内)
 };
 
 } // namespace Tsuitate

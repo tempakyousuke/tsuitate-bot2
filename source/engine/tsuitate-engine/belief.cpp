@@ -4,7 +4,9 @@
 #if defined(TSUITATE_ENGINE)
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <mutex>
 
 #include "../../movegen.h"
@@ -12,6 +14,20 @@
 
 namespace YaneuraOu {
 namespace Tsuitate {
+
+bool anomaly_report_slot() {
+	static std::atomic<int> printed{0};
+	// 上限に達した後は素の load だけ(ワーカーが同じキャッシュ行を取り合わない)
+	if (printed.load(std::memory_order_relaxed) >= 20)
+		return false;
+	return printed.fetch_add(1, std::memory_order_relaxed) < 20;
+}
+
+void report_illegal_move(const Position& pos, Move m, const char* where) {
+	if (anomaly_report_slot())
+		sync_cout << "info string ILLEGAL MOVE in " << where << ": move=" << to_usi_string(m)
+		          << " sfen=" << pos.sfen() << sync_endl;
+}
 
 void Belief::reset(Color us, const Config& cfg) {
 	us_  = us;
@@ -23,6 +39,7 @@ void Belief::reset(Color us, const Config& cfg) {
 	parts_.clear();
 	graveyard_.clear();
 	curFouls_.clear();
+	badAdvance_ = 0;
 	for (int i = 0; i < cfg_.particles; ++i)
 		parts_.push_back(std::make_unique<Particle>());
 	essLast_ = double(parts_.size());
@@ -221,16 +238,44 @@ ParticlePtr Belief::clone_of(const GameHistory& hist, const Particle& src) {
 	auto p = std::make_unique<Particle>();
 	p->relax = src.relax;
 	p->logw  = src.logw;  // §2 SIR: 複製は親の観測重みを引き継ぐ
+	// 親の履歴をそのまま進めるので、ここは**唯一の「この局面で未検査の手」を
+	// 進める経路**。親の oppMoves 列が cursor_ までの OppMove イベント数と食い違って
+	// いれば(範囲外・ずれ)、不正な手か「合法だが別の手」を進めてしまう。前者は
+	// try_advance が弾き、後者は末尾の「複製 == 親」の検査が捕まえる
+	// (9.5章の segfault の最有力候補がこの経路。検査は両方向のずれを検出する)。
 	size_t k = 0;
 	for (size_t i = 0; i < cursor_; ++i) {
 		const HistEvent& ev = hist.events[i];
 		if (ev.kind == EvKind::OurMove) {
-			p->advance(ev.move);
+			if (!p->try_advance(ev.move)) {
+				report_illegal_move(p->pos, ev.move, "clone_of(our)");
+				++badAdvance_;
+				return nullptr;
+			}
 		} else if (ev.kind == EvKind::OppMove) {
+			if (k >= src.oppMoves.size()) {
+				if (anomaly_report_slot())
+					sync_cout << "info string clone_of: oppMoves too short (" << src.oppMoves.size()
+					          << ") at event " << i << "/" << cursor_ << sync_endl;
+				++badAdvance_;
+				return nullptr;
+			}
 			Move m = src.oppMoves[k++];
 			p->oppMoves.push_back(m);
-			p->advance(m);
+			if (!p->try_advance(m)) {
+				report_illegal_move(p->pos, m, "clone_of(opp)");
+				++badAdvance_;
+				return nullptr;
+			}
 		}
+	}
+	if (p->pos.key() != src.pos.key()) {
+		if (anomaly_report_slot())
+			sync_cout << "info string clone_of: replica != parent (oppMoves=" << k << "/"
+			          << src.oppMoves.size() << ") parent=" << src.pos.sfen()
+			          << " child=" << p->pos.sfen() << sync_endl;
+		++badAdvance_;
+		return nullptr;
 	}
 	return p;
 }
@@ -299,6 +344,7 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 			ParticlePtr        p;
 			std::vector<Move>  moves;
 			Move               chosen;
+			bool               cloneFailed = false;  // 複製に失敗した親は再試行しない
 		};
 		std::vector<Pending> pend;
 		std::vector<Move>    buf;
@@ -335,15 +381,22 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 		size_t idx = 0;
 		while (budget > 0 && !pend.empty()) {
 			Pending& pd = pend[idx % pend.size()];
-			if (!pd.p->synthetic && pd.moves.size() >= 2) {
+			if (!pd.p->synthetic && !pd.cloneFailed && pd.moves.size() >= 2) {
 				std::vector<Move> excl = {pd.chosen};
 				Move alt = sample_policy(*pd.p, pd.moves, excl, rng_);
 				if (alt != Move::none()) {
-					auto child = clone_of(hist, *pd.p);
-					child->oppMoves.push_back(alt);
-					child->advance(alt);
-					next.push_back(std::move(child));
-					--budget;
+					// alt は親の整合手(合法)で、複製は親と一致することを clone_of が
+					// 保証するので、子でも合法。複製に失敗した親(履歴が壊れている)は
+					// 二度と試さない: 失敗は cursor_ 手ぶんのリプレイを丸ごと捨てるので、
+					// 同じ親を4周ぶん繰り返すと sync の締め切りを食い潰す
+					if (auto child = clone_of(hist, *pd.p)) {
+						child->oppMoves.push_back(alt);
+						child->advance(alt);
+						next.push_back(std::move(child));
+						--budget;
+					} else {
+						pd.cloneFailed = true;
+					}
 				} else {
 					// 代替手がない親はスキップ
 				}
@@ -448,6 +501,8 @@ void Belief::weights_normalize_and_resample(const GameHistory& hist) {
 					continue;  // 自前で組んだSFENなので失敗しないはずだが、保険
 			} else {
 				dup = clone_of(hist, *parts_[i]);
+				if (!dup)
+					continue;  // 親の履歴が複製できない(不整合の記録は clone_of が出す)
 			}
 			next.push_back(std::move(dup));
 		}

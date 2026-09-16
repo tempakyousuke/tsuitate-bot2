@@ -32,6 +32,24 @@ struct ThinkResult {
 	uint64_t    nodes = 0;        // 確定化探索の総ノード数(診断。nodes/sの分子)
 	TimePoint   elapsedMs = 0;
 
+	// §9 stage2 スケジューリングの診断。
+	//   jobs2 / trunc2: stage2 で完走したパスのジョブ数と、そのうちノード上限
+	//     (nodesLimit2)に当たって値が汚れたジョブ数
+	//   gateSkipped: まだ深いパスが残っていたのに開始ゲートで止めた(1/0)
+	//   passes: 完走したパスの (深さ, 所要ms)。予測ゲートの較正(passGrowth)用
+	uint64_t    jobs2 = 0, trunc2 = 0;
+	int         gateSkipped = 0;
+	std::vector<std::pair<int, int>> passes;
+	// 予算の内訳(ms): 信念の同期 / stage1 / stage2(残りは選択などの端数)
+	TimePoint   syncMs = 0, stage1Ms = 0, stage2Ms = 0;
+	// 候補手の数と stage1 のジョブ数(候補×粒子)。stage1 の重さの診断
+	size_t      cands = 0;
+	uint64_t    jobs1 = 0;
+	// 9.5章の診断(どちらも**この決定**の回数): 信念の同期が不正として捨てた粒子と、
+	// 探索ジョブのガード(粒子の局面が scan 時点から変わっていた)で飛ばしたジョブ
+	long long   badAdvance = 0;
+	uint64_t    badJobs = 0;
+
 	// スループット(kilo nodes / 秒 = nodes / 経過ms)。分母は信念同期込みの
 	// 思考時間全体。knps の**定義はここ1つ**: 実対局の info 行も、アリーナ診断
 	// (合計値のプール)も同じ「nodes/経過ms」で、配備とアリーナのゲート数値を
@@ -52,6 +70,9 @@ public:
 	void new_game() {
 		ctx_.clear();
 		thinkStamp_ = 0;
+		jobMs1_ = 0.0;
+		for (auto& v : jobMs2_)
+			v = 0.0;
 	}
 
 private:
@@ -62,6 +83,15 @@ private:
 	// think() の通し番号。SearchContext::stamp と突き合わせて
 	// 「この think でもう begin_think したか」をワーカー自身が判定する。
 	uint32_t thinkStamp_ = 0;
+
+	// §9 予算スケジューラのコストモデル: 1ジョブ((候補,粒子)の探索)あたりの
+	// 実測 wall 時間(ms)の指数移動平均。stage1(qsearch)と stage2 の深さ別。
+	// 対局内で学習し、new_game で捨てる(スレッド数・予算・局面の複雑さで変わる
+	// 量なので、対局をまたいで持ち越さない)。0 = 未観測。
+	static constexpr int JOB_MS_SLOTS = Config::kMaxSearchDepth + 1;
+	double   jobMs1_ = 0.0;
+	double   jobMs2_[JOB_MS_SLOTS] = {};
+	static double ema_update(double prev, double x) { return prev > 0.0 ? 0.7 * prev + 0.3 * x : x; }
 };
 
 // ---------------------------------------------------------------------------

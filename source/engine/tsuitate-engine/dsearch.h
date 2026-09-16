@@ -102,6 +102,9 @@ struct DSearch {
 	// nodesLimit: このノード数を超えたら打ち切って静的評価を返す(粒子1つ分の保険)
 	uint64_t nodes      = 0;
 	uint64_t nodesLimit = 200000;
+	// ノード上限に当たって途中から静的評価を返した(値が汚れている)か。
+	// 探索の打ち切り・TT書き込みの抑止・think() の trunc 診断が**同じ述語**を使う
+	bool truncated() const { return nodes > nodesLimit; }
 
 	// --- 相手モデル(非千里眼化。cfg=nullptr または cfg->oppModel=0 で従来動作) ---
 	// cfg : 相手モデルの設定。nullptr なら素の千里眼αβ
