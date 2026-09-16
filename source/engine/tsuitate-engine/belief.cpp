@@ -15,17 +15,11 @@
 namespace YaneuraOu {
 namespace Tsuitate {
 
-// 不正な advance の回数(プロセス全体)。stderr の記録は最初の 20 回だけ出す
-// (大量に出ても原因調査には役立たず、アリーナの出力を埋めるだけ)。
-static std::atomic<long long> g_badAdvance{0};
-long long bad_advance_count() { return g_badAdvance.load(); }
-
-void Particle::report_bad_advance(Move m) const {
-	const long long n = ++g_badAdvance;
-	if (n <= 20)
-		fprintf(stderr, "tsuitate: BAD ADVANCE #%lld move=%s synthetic=%d relax=%d oppMoves=%zu sfen=%s\n",
-		        n, to_usi_string(m).c_str(), int(synthetic), relax, oppMoves.size(),
-		        pos.sfen().c_str());
+void report_illegal_move(const Position& pos, Move m, const char* where) {
+	static std::atomic<int> printed{0};
+	if (printed.fetch_add(1) < 20)
+		fprintf(stderr, "tsuitate: ILLEGAL MOVE in %s: move=%s sfen=%s\n", where,
+		        to_usi_string(m).c_str(), pos.sfen().c_str());
 }
 
 void Belief::reset(Color us, const Config& cfg) {
@@ -38,6 +32,7 @@ void Belief::reset(Color us, const Config& cfg) {
 	parts_.clear();
 	graveyard_.clear();
 	curFouls_.clear();
+	badAdvance_ = 0;
 	for (int i = 0; i < cfg_.particles; ++i)
 		parts_.push_back(std::make_unique<Particle>());
 	essLast_ = double(parts_.size());
@@ -236,25 +231,43 @@ ParticlePtr Belief::clone_of(const GameHistory& hist, const Particle& src) {
 	auto p = std::make_unique<Particle>();
 	p->relax = src.relax;
 	p->logw  = src.logw;  // §2 SIR: 複製は親の観測重みを引き継ぐ
+	// 親の履歴をそのまま進めるので、ここは**唯一の「この局面で未検査の手」を
+	// 進める経路**。親の oppMoves 列が cursor_ までの OppMove イベント数と食い違って
+	// いれば(範囲外・ずれ)、不正な手か「合法だが別の手」を進めてしまう。前者は
+	// try_advance が弾き、後者は末尾の「複製 == 親」の検査が捕まえる
+	// (9.5章の segfault の最有力候補がこの経路。検査は両方向のずれを検出する)。
 	size_t k = 0;
 	for (size_t i = 0; i < cursor_; ++i) {
 		const HistEvent& ev = hist.events[i];
 		if (ev.kind == EvKind::OurMove) {
-			if (!p->advance(ev.move))
+			if (!p->try_advance(ev.move)) {
+				report_illegal_move(p->pos, ev.move, "clone_of(our)");
+				++badAdvance_;
 				return nullptr;
+			}
 		} else if (ev.kind == EvKind::OppMove) {
-			// 親の oppMoves 列は cursor_ までの OppMove イベント数と一致しているはず。
-			// 足りなければ複製を諦める(範囲外を読んで不正な手を進めない)
 			if (k >= src.oppMoves.size()) {
 				fprintf(stderr, "tsuitate: clone_of: oppMoves too short (%zu) at event %zu/%zu\n",
 				        src.oppMoves.size(), i, cursor_);
+				++badAdvance_;
 				return nullptr;
 			}
 			Move m = src.oppMoves[k++];
 			p->oppMoves.push_back(m);
-			if (!p->advance(m))
+			if (!p->try_advance(m)) {
+				report_illegal_move(p->pos, m, "clone_of(opp)");
+				++badAdvance_;
 				return nullptr;
+			}
 		}
+	}
+	if (p->pos.key() != src.pos.key()) {
+		static std::atomic<int> printed{0};
+		if (printed.fetch_add(1) < 20)
+			fprintf(stderr, "tsuitate: clone_of: replica != parent (oppMoves=%zu/%zu)\n  parent=%s\n  child =%s\n",
+			        k, src.oppMoves.size(), src.pos.sfen().c_str(), p->pos.sfen().c_str());
+		++badAdvance_;
+		return nullptr;
 	}
 	return p;
 }
@@ -281,10 +294,11 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 				bool gc = p->pos.gives_check(ev.move);
 				ok = gc == (ev.check == CheckAfter::Yes);
 			}
-			if (!ok || !p->advance(ev.move)) {
+			if (!ok) {
 				bury(*p);
 				continue;
 			}
+			p->advance(ev.move);
 			alive.push_back(std::move(p));
 		}
 		parts_ = std::move(alive);
@@ -362,13 +376,15 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 				std::vector<Move> excl = {pd.chosen};
 				Move alt = sample_policy(*pd.p, pd.moves, excl, rng_);
 				if (alt != Move::none()) {
-					auto child = clone_of(hist, *pd.p);
-					if (child) {
+					// alt は親の整合手(合法)で、複製は親と一致することを clone_of が
+					// 保証するので、子でも合法。複製に失敗した親は budget を消費しない
+					// (試行回数は下の idx の上限で抑える)
+					if (auto child = clone_of(hist, *pd.p)) {
 						child->oppMoves.push_back(alt);
-						if (child->advance(alt))
-							next.push_back(std::move(child));
+						child->advance(alt);
+						next.push_back(std::move(child));
+						--budget;
 					}
-					--budget;
 				} else {
 					// 代替手がない親はスキップ
 				}
@@ -381,10 +397,8 @@ void Belief::apply_event(const GameHistory& hist, const HistEvent& ev) {
 		// 4) 親を進める
 		for (auto& pd : pend) {
 			pd.p->oppMoves.push_back(pd.chosen);
-			if (pd.p->advance(pd.chosen))
-				next.push_back(std::move(pd.p));
-			else
-				bury(*pd.p);
+			pd.p->advance(pd.chosen);
+			next.push_back(std::move(pd.p));
 		}
 		parts_ = std::move(next);
 		break;
@@ -982,8 +996,7 @@ ParticlePtr Belief::replay_one(const GameHistory& hist, int relax, PRNG& rng,
 						return nullptr;
 				}
 			}
-			if (!p->advance(ev.move))
-				return nullptr;
+			p->advance(ev.move);
 			break;
 		}
 		case EvKind::OurFoul:
@@ -1013,8 +1026,7 @@ ParticlePtr Belief::replay_one(const GameHistory& hist, int relax, PRNG& rng,
 			if (m == Move::none())
 				return nullptr;
 			p->oppMoves.push_back(m);
-			if (!p->advance(m))
-				return nullptr;
+			p->advance(m);
 			break;
 		}
 		}

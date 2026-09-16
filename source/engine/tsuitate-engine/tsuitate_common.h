@@ -150,6 +150,10 @@ std::vector<Move> generate_candidates(const OwnView& view);
 // ---------------------------------------------------------------------------
 
 struct Config {
+	// searchDepth の上限。設定キーの範囲検査と、深さ別のコストモデル
+	// (Thinker::jobMs2_)の配列長の**両方**がここから決まる(二重定義しない)
+	static constexpr int kMaxSearchDepth = 64;
+
 	int  particles      = 256;   // 粒子数の目標
 	int  stage1Samples  = 24;    // stage1(静止探索)に使う粒子数
 	int  stage2Samples  = 48;    // stage2(深い探索)に使う粒子数
@@ -341,6 +345,13 @@ struct Config {
 	// depthStep: 反復深化の刻み(1 or 2)。既定2(d=2,4,6)。1にすると d=2,3,4,…
 	//   で、予算で6に届かないとき5で止まれる(2だと4で止まる)。
 	int    depthStep  = 2;
+	// s2MarginMs: stage2 の締め切り余白(ms)。パスの破棄判定は締め切りのこれだけ
+	//   手前で行う。1ジョブは nodesLimit2 でしか止まらないので、余白より長い
+	//   ジョブが直前に始まると締め切りを超過しうる(超過は高々1ジョブぶん)。
+	//   passGate とは独立のつまみ。200ms のアリーナ予算では 50 が予算の25%を
+	//   占めるので、9.4章の A/B は `s2margin 20` を併用した(passGate に連動させて
+	//   いた初版は、比較がゲートと余白の合成になっていた)。
+	int    s2MarginMs = 50;
 	// stage2 の1ジョブ((候補,粒子)の探索)のノード上限。超えたら以降のノードは
 	// 静的評価を返して打ち切る(値は汚れる)。深さ4〜6の木はこの上限に当たりやすく、
 	// 「深さ4」が実質どこまで読めているかは trunc 診断で見ること。

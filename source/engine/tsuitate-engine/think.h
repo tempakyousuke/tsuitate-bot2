@@ -45,6 +45,10 @@ struct ThinkResult {
 	// 候補手の数と stage1 のジョブ数(候補×粒子)。stage1 の重さの診断
 	size_t      cands = 0;
 	uint64_t    jobs1 = 0;
+	// 9.5章の診断: 信念が不正として捨てた粒子の累計(対局内。Belief::bad_advance)と、
+	// 探索ジョブの合法性ガードで飛ばしたジョブ数(この決定)
+	long long   badAdvance = 0;
+	uint64_t    badJobs = 0;
 
 	// スループット(kilo nodes / 秒 = nodes / 経過ms)。分母は信念同期込みの
 	// 思考時間全体。knps の**定義はここ1つ**: 実対局の info 行も、アリーナ診断
@@ -84,7 +88,7 @@ private:
 	// 実測 wall 時間(ms)の指数移動平均。stage1(qsearch)と stage2 の深さ別。
 	// 対局内で学習し、new_game で捨てる(スレッド数・予算・局面の複雑さで変わる
 	// 量なので、対局をまたいで持ち越さない)。0 = 未観測。
-	static constexpr int JOB_MS_SLOTS = 65;  // searchDepth の上限(64)+1
+	static constexpr int JOB_MS_SLOTS = Config::kMaxSearchDepth + 1;
 	double   jobMs1_ = 0.0;
 	double   jobMs2_[JOB_MS_SLOTS] = {};
 	static double ema_update(double prev, double x) { return prev > 0.0 ? 0.7 * prev + 0.3 * x : x; }

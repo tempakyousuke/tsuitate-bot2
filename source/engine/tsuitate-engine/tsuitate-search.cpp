@@ -112,7 +112,7 @@ bool set_config_key(Config& c, const std::string& key, const std::string& val) {
 	else if (key == "stage1")       apply_i(c.stage1Samples, 1, 100000);
 	else if (key == "stage2")       apply_i(c.stage2Samples, 1, 100000);
 	else if (key == "topk")         apply_i(c.stage2TopK, 1, 1000);
-	else if (key == "depth")        apply_i(c.searchDepth, 0, 64);
+	else if (key == "depth")        apply_i(c.searchDepth, 0, Config::kMaxSearchDepth);
 	else if (key == "budget")       apply_i(c.budgetMs, 1, 3600000);
 	else if (key == "regentries")   apply_i(c.regenTries, 0, 10000000);
 	else if (key == "blocksamples") apply_i(c.blockSamples, 1, 100000);
@@ -156,6 +156,7 @@ bool set_config_key(Config& c, const std::string& key, const std::string& val) {
 	else if (key == "halving")      apply_i(c.halving, 0, 1);
 	else if (key == "stage1pct")    apply_i(c.stage1Pct, 0, 100);
 	else if (key == "depthstep")    apply_i(c.depthStep, 1, 2);
+	else if (key == "s2margin")     apply_i(c.s2MarginMs, 1, 10000);
 	else if (key == "nodeslimit2")  apply_i(c.nodesLimit2, 1000, 100000000);
 	// 重み付き粒子フィルタ(§2 SIR)。0で従来どおり(等重み)。
 	else if (key == "sir")          apply_i(c.sir, 0, 1);
@@ -554,12 +555,13 @@ private:
 		if (cfg_.logLevel >= 2) {
 			// §9 stage2 スケジューリングの診断(パスごとの所要時間・ノード上限打ち切り・
 			// ゲート停止)。passgrowth の較正はこの行の passes= から読む
-			std::string ps;
+			std::vector<std::string> ps;
 			for (auto& [d, ms] : r.passes)
-				ps += (ps.empty() ? "" : ",") + std::to_string(d) + ":" + std::to_string(ms);
-			sync_cout << "info string stage2 passes=" << (ps.empty() ? "-" : ps)
+				ps.push_back(std::to_string(d) + ":" + std::to_string(ms));
+			sync_cout << "info string stage2 passes=" << (ps.empty() ? "-" : StringExtension::Join(ps, ","))
 			          << " jobs=" << r.jobs2 << " trunc=" << r.trunc2
-			          << " gate_skipped=" << r.gateSkipped << sync_endl;
+			          << " gate_skipped=" << r.gateSkipped
+			          << " bad_advance=" << r.badAdvance << " bad_jobs=" << r.badJobs << sync_endl;
 		}
 		if (r.best == Move::none())
 			sync_cout << "bestmove resign" << sync_endl;

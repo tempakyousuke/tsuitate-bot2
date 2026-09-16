@@ -73,6 +73,9 @@ struct ArenaStats {
 	long long passMsSum[8] = {}, passCnt[8] = {};
 	long long syncMsSum = 0, stage1MsSum = 0, stage2MsSum = 0;  // 予算内訳(決定ごと)
 	long long candsSum = 0, jobs1Sum = 0;  // 候補数と stage1 ジョブ数(決定ごと)
+	// 9.5章: 信念が不正として捨てた粒子(局ごとの累計の差分を choose で足す)と
+	// 探索ジョブのガードで飛ばしたジョブ。側ごとに帰属する
+	long long badAdvance = 0, badJobs = 0;
 	double    pLegalSum = 0;     // 整数%で持つと二重に切り捨てて0.5pp沈むのでdoubleで持つ
 	long long relaxHist[4] = {};  // 緩和レベル別の手番数(3=合成粒子)
 	double    kingAccSum = 0, occAccSum = 0;
@@ -127,13 +130,21 @@ struct BeliefPlayer : IPlayer {
 	    : cfg(c), budgetMs(budget), slot(slot_) {}
 
 	ThinkResult lastResult;
+	long long   lastBadAdvance = 0;  // 直前の決定時点の Belief::bad_advance(対局内累計)
 
-	void new_game(Color us) override { core.new_game(us, cfg); }
+	void new_game(Color us) override {
+		core.new_game(us, cfg);
+		lastBadAdvance = 0;
+	}
 	Move choose() override {
 		ThinkResult r = core.think(budgetMs);
 		g_stats[slot].add_decision(r);
-		lastResult = r;
-		return r.best;
+		g_stats[slot].badAdvance += r.badAdvance - lastBadAdvance;
+		g_stats[slot].badJobs    += (long long) r.badJobs;
+		lastBadAdvance = r.badAdvance;
+		const Move best = r.best;
+		lastResult = std::move(r);
+		return best;
 	}
 	// 1手番につき1回だけ呼ばれる診断フック(思考には一切使わない)。
 	// 直前の choose() の結果と、審判だけが持つ完全情報を突き合わせる。
@@ -610,7 +621,7 @@ void run_arena(const ArenaOptions& opt) {
 			std::cout << "-";
 		// 予算の内訳(決定あたり平均ms)。sync が締め切りいっぱいまで使うと
 		// stage2 に残る時間が構造的に決まる
-		std::cout << " bad_advance=" << bad_advance_count()
+		std::cout << " bad_advance=" << g.badAdvance << " bad_jobs=" << g.badJobs
 		          << " ms(sync/s1/s2)=" << (double(g.syncMsSum) / double(g.decisions))
 		          << "/" << (double(g.stage1MsSum) / double(g.decisions))
 		          << "/" << (double(g.stage2MsSum) / double(g.decisions))

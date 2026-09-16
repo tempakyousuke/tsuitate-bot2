@@ -125,6 +125,7 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	const int syncPct = resolved_sync_pct(cfg);
 	belief.sync(hist, view, t0 + budgetMs * syncPct / 100);
 	res.syncMs     = now() - t0;
+	res.badAdvance = belief.bad_advance();
 	res.nParticles = belief.size();
 	res.relaxLevel = belief.relaxLevel();
 	res.ess        = belief.ess();
@@ -295,8 +296,13 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	size_t k1Budget = size_t(cfg.stage1Samples);
 	if (cfg.stage1Pct > 0 && jobMs1_ > 0.0 && M > 0) {
 		const double maxJobs = double(budgetMs) * double(cfg.stage1Pct) / 100.0 / jobMs1_;
-		k1Budget = size_t(std::clamp(maxJobs / double(M), 2.0, double(cfg.stage1Samples)));
+		const double hi      = double(cfg.stage1Samples);
+		const double lo      = std::min(2.0, hi);  // stage1Samples は 1 も許す(clamp は lo<=hi が前提)
+		k1Budget = size_t(std::clamp(maxJobs / double(M), lo, hi));
 	}
+	// stage1 の開始時刻(stage1Pct の時間門の基準。同期が長かった手番で配分ぶんを
+	// 同期に食われないよう、t0 ではなく stage1 の開始から測る)。stage1 直前に更新する
+	TimePoint tStage1 = t0;
 	auto stage1_cap = [&](TimePoint t) -> size_t {
 		size_t cap = std::min(size_t(cfg.stage1Samples), k1Budget);  // 設定値が4未満ならそちらが上限
 		if (t > deadline - 100)
@@ -305,18 +311,16 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 			cap = std::min<size_t>(cap, 4);
 		// §9 stage1Pct の時間門: 配分を過ぎたら「まだ1サンプルもない候補」だけ
 		// (コストモデルの読み違い(局面の複雑さの急変)に対する保険)
-		if (cfg.stage1Pct > 0 && t > t0 + budgetMs * cfg.stage1Pct / 100)
+		if (cfg.stage1Pct > 0 && t > tStage1 + budgetMs * cfg.stage1Pct / 100)
 			cap = std::min<size_t>(cap, 1);
 		return cap;
 	};
 
-	// stage2 の締め切り(パスの破棄判定)。従来は固定で締め切りの 50ms 手前。
-	// §9 passGate では予算の10%(10〜50ms)にする: 200ms のアリーナ予算では
-	// 固定50msが予算の25%を占めて深さ4のパスが構造的に入らない一方、
-	// 実対局の予算(≥300ms、典型2.4s)では従来と同じ50msに収束する。
-	// 1ジョブの上限は nodesLimit2 で抑えてあるので、超過は高々1ジョブぶん。
-	const TimePoint s2Margin   = cfg.passGate ? std::clamp<TimePoint>(budgetMs / 10, 10, 50) : 50;
-	const TimePoint s2Deadline = deadline - s2Margin;
+	// stage2 の締め切り(パスの破棄判定)= 締め切りの s2MarginMs 手前(既定50)。
+	// passGate とは独立のつまみ(Config 参照)。ジョブは nodesLimit2 でしか止まらない
+	// ので、余白より長いジョブが直前に始まれば締め切りを超過しうる(高々1ジョブぶん。
+	// 並列時はワーカー数ぶん同時に)。
+	const TimePoint s2Deadline = deadline - std::max(1, cfg.s2MarginMs);
 
 	// (候補手, 粒子) 1ジョブの評価。並列(parallel_eval)・逐次(stage1/stage2)の
 	// **すべてのループがこれを呼ぶ**。二重実装だと DSearch のフィールド追加や
@@ -326,8 +330,11 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	// stage1 を千里眼qsearchのままにすると「進めた駒は必ず取られる」序列で
 	// 上位が決まり、相手モデルが評価したい前進手が stage2 に届かない(Config参照)。
 	// truncOut: ノード上限に当たって値が汚れたジョブ数(§9 診断。stage2 だけ集計する)
+	// ok: false なら評価していない(呼び出し側はこのジョブを数えないこと)
+	std::atomic<uint64_t> badJobs{0};
 	auto eval_one = [&](Position& pos, Move m, int depth, uint64_t nodesLimit,
-	                    SearchContext* sctx, uint64_t& nodesOut, uint64_t& truncOut) -> double {
+	                    SearchContext* sctx, uint64_t& nodesOut, uint64_t& truncOut,
+	                    bool& ok) -> double {
 		StateInfo st;
 		DSearch   ds;
 		ds.nodesLimit = nodesLimit;
@@ -335,14 +342,16 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		ds.us         = view.us;
 		ds.foulGain   = foulGain;
 		ds.ctx        = sctx;
-		// 保険: legalIdx で合法な粒子だけが来るはずだが、不正な手を do_move に
-		// 渡すと segfault する(9.5章)。ここで弾いて記録し、値は静的評価で代用する
-		if (!(pos.pseudo_legal_s<true>(m) && pos.legal(m))) {
-			static std::atomic<int> reported{0};
-			if (reported.fetch_add(1) < 20)
-				fprintf(stderr, "tsuitate: BAD JOB move=%s depth=%d sfen=%s\n",
-				        to_usi_string(m).c_str(), depth, pos.sfen().c_str());
-			return squash_cp(Value(0));
+		// 保険: legalIdx(scan_legality)で合法と分かった粒子だけが来るので、
+		// 構造上ここは成立しないはず。だが不正な手を do_move に渡すと segfault
+		// する(9.5章)ので、移動元が空の手(実際に観測されたクラッシュの型)だけ
+		// 安い検査で弾き、記録して**ジョブを数えない**(偽の値を平均に混ぜない)。
+		ok = true;
+		if (!m.is_drop() && pos.piece_on(m.from_sq()) == NO_PIECE) {
+			report_illegal_move(pos, m, "eval_one");
+			badJobs.fetch_add(1, std::memory_order_relaxed);
+			ok = false;
+			return 0.0;
 		}
 		pos.do_move(m, st);
 		Value v;
@@ -403,11 +412,14 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	// §2 SIR では重みに比例した系統抽出になる: 選ばれた粒子の等重み平均が
 	// 重み付き期待値の近似になるので、評価ループ側は変更なしで済む。
 	// 重い粒子は複数回選ばれうる(それが正しい重み付け)。sir=0 の経路は従来と同一。
+	// 候補の合法粒子 idx から k 個読むときの実際の個数。pick_particles と
+	// stage2 のジョブ数予測(count_jobs)が**同じ規則**を使う
+	auto pick_count = [](const std::vector<uint32_t>& idx, size_t k) { return std::min(k, idx.size()); };
 	auto pick_particles = [&](const std::vector<uint32_t>& idx, size_t k) {
 		std::vector<uint32_t> out;
 		if (idx.empty())
 			return out;
-		k = std::min(k, idx.size());
+		k = pick_count(idx, k);
 		if (cfg.sir) {
 			double total = 0;
 			for (uint32_t j : idx)
@@ -450,7 +462,7 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	// candIdx: 評価する候補のindex(cands への添字)
 	// sels   : candIdx と同じ長さ。候補ごとの評価粒子(pick_particles の出力)
 	// depth  : 0 = stage1(qsearch / oppReplyKStage1 の深さ1探索) / >0 = stage2 の深さ
-	// abortable: true なら deadline-50 で中断してパスを破棄する(stage2 の意味論)。
+	// abortable: true なら s2Deadline で中断してパスを破棄する(stage2 の意味論)。
 	//            false(stage1)では中断しないが、deadline-100 を過ぎたら
 	//            「まだ1サンプルもない候補」以外のジョブを飛ばす
 	//            (逐次版の「締め切りが迫ったら k1=1 に絞る」に対応する縮退)
@@ -522,8 +534,11 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 						if (have > 0 && size_t(have) >= stage1_cap(now()))
 							continue;
 					}
+					bool ok = true;
 					vals[offset[g] + q] =
-					    eval_one(pos, cands[candIdx[c]], depth, nodesLimit, sctx, myNodes, myTrunc);
+					    eval_one(pos, cands[candIdx[c]], depth, nodesLimit, sctx, myNodes, myTrunc, ok);
+					if (!ok)
+						continue;  // 評価していないジョブは完了に数えない
 					done[offset[g] + q] = 1;
 					if (!abortable)
 						cnt1[c].fetch_add(1, std::memory_order_relaxed);
@@ -559,7 +574,7 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		return false;
 	};
 
-	const TimePoint tStage1 = now();
+	tStage1 = now();
 	// 4) stage1: 全候補を静止探索で粗く評価。
 	// 締め切りが迫ったらサンプル数を段階的に絞る(全候補に必ず何らかの値を付ける)
 	std::vector<double> mean1(M, 0.0), comb1(M);
@@ -593,12 +608,16 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		for (size_t i = 0; i < M; ++i) {
 			auto sel = pick_particles(legalIdx[i], stage1_cap(now()));
 			double sum = 0;
-			for (uint32_t j : sel)
-				sum += eval_one(parts[j]->pos, cands[i], /*depth=*/0,
-				                /*nodesLimit=*/20000, ctx_for(0), res.nodes, trunc1);
-			mean1[i] = sel.empty() ? 0.0 : sum / double(sel.size());
+			size_t cnt = 0;
+			for (uint32_t j : sel) {
+				bool ok = true;
+				double v = eval_one(parts[j]->pos, cands[i], /*depth=*/0,
+				                    /*nodesLimit=*/20000, ctx_for(0), res.nodes, trunc1, ok);
+				if (ok) { sum += v; ++cnt; }
+			}
+			mean1[i] = cnt ? sum / double(cnt) : 0.0;
 			comb1[i] = combined(i, mean1[i]);
-			res.jobs1 += sel.size();
+			res.jobs1 += cnt;
 		}
 	}
 
@@ -609,11 +628,16 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	// この決定の局面の「複雑さ」= stage1 の実測単価 / その EMA。qsearch の木の
 	// 大きさは同じ局面の深い探索の木の大きさと相関するので、stage2 の推定単価を
 	// これで補正する(EMA だけでは中盤の急変に追いつかず、3倍読み違えていた)。
-	double complexity = 1.0;
+	// haveComplexity=false(標本が小さすぎて測れない決定)のときは stage2 の単価の
+	// EMA を更新しない: 補正なしの生の単価を「補正済み」の列に混ぜると単位がずれる
+	double complexity     = 1.0;
+	bool   haveComplexity = false;
 	if (res.jobs1 >= 64 && res.stage1Ms >= 2) {
 		const double x = double(res.stage1Ms) / double(res.jobs1);
-		if (jobMs1_ > 0.0)
-			complexity = std::clamp(x / jobMs1_, 0.5, 4.0);
+		if (jobMs1_ > 0.0) {
+			complexity     = std::clamp(x / jobMs1_, 0.5, 4.0);
+			haveComplexity = true;
+		}
 		jobMs1_ = ema_update(jobMs1_, x);
 	}
 	const TimePoint tStage2 = now();
@@ -651,11 +675,14 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	auto count_jobs = [&](const std::vector<size_t>& cs, size_t k) -> uint64_t {
 		uint64_t n = 0;
 		for (size_t i : cs)
-			n += std::min(k, legalIdx[i].size());
+			n += pick_count(legalIdx[i], k);
 		return n;
 	};
 	for (int d = 2; d <= cfg.searchDepth; d += step) {
 		size_t k2 = size_t(cfg.stage2Samples);
+		// このパスで読む候補集合。halving で絞った集合は**パスが完走してから** top に
+		// 確定する(破棄されたパスの絞り込みで最終選択の集合を狭めない)
+		std::vector<size_t> cur = top;
 		if (depthDone > 0) {
 			// 次のパスに入れるかの判定。
 			//   従来: 予算の60%を過ぎていたら入らない(固定ゲート)。
@@ -672,26 +699,21 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 				                 [&](size_t a, size_t b) { return comb2[a] > comb2[b]; });
 				nextTop.resize(std::max<size_t>(2, (top.size() + 1) / 2));
 			}
-			bool go;
-			if (cfg.passGate) {
-				const double est = job_ms_est(d) * double(count_jobs(nextTop, k2));
-				go = now() + TimePoint(est * 0.7) <= s2Deadline;
-			} else {
-				go = now() <= t0 + budgetMs * 3 / 5;
-			}
+			const TimePoint tNow  = now();
+			const double    jmEst = job_ms_est(d);
+			const double    est   = jmEst * double(count_jobs(nextTop, k2));
+			const bool go = cfg.passGate ? tNow + TimePoint(est * 0.7) <= s2Deadline
+			                             : tNow <= t0 + budgetMs * 3 / 5;
 			// 予測ゲートの較正用トレース(stderr。loglevel 2 のときだけ)
 			if (cfg.logLevel >= 2)
 				fprintf(stderr, "gate d=%d go=%d t=%lld est=%.1f s2dl=%lld top=%zu next=%zu jm=%.4f cx=%.2f last=%lld\n",
-				        d, int(go), (long long)(now() - t0), job_ms_est(d) * double(count_jobs(nextTop, k2)),
-				        (long long)(s2Deadline - t0), top.size(), nextTop.size(), job_ms_est(d), complexity, (long long)lastPassMs);
+				        d, int(go), (long long)(tNow - t0), est, (long long)(s2Deadline - t0),
+				        top.size(), nextTop.size(), jmEst, complexity, (long long)lastPassMs);
 			if (!go) {
 				res.gateSkipped = 1;
 				break;
 			}
-			// 絞られた候補は最終選択の対象からも外れる: 浅いパスの値と深いパスの
-			// 値を同じ土俵で比べると、深く読んで下がった本命より浅い値の残った
-			// 脇の手が勝ってしまう。
-			top = std::move(nextTop);
+			cur = std::move(nextTop);
 		} else if (cfg.passGate) {
 			// 最初のパス(d=2)。丸ごと収まらない予測なら粒子数を収まる範囲に
 			// 減らす(下限8)。深さ0(stage1 の qsearch だけ)で終わるより、粒子を
@@ -699,11 +721,14 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 			// なら従来どおり全粒子で試す。
 			const double est   = job_ms_est(d);
 			const double avail = double(s2Deadline - now());
-			if (est > 0.0 && avail > 0.0 && !top.empty()) {
-				const double perSample = est * double(top.size());  // 1候補1粒子ぶんの上限
+			if (est > 0.0 && avail > 0.0 && !cur.empty()) {
+				const double perSample = est * double(cur.size());  // 1候補1粒子ぶんの上限
 				const double fit = avail / perSample;
+				// 下限は 8 と設定値の小さいほう(stage2Samples < 8 の設定で「減らす」
+				// つもりの分岐が設定値より増やしてはいけない)
+				const double lo = std::min(8.0, double(k2));
 				if (fit < double(k2))
-					k2 = size_t(std::max(8.0, std::floor(fit)));
+					k2 = size_t(std::max(lo, std::floor(fit)));
 			}
 		}
 		const TimePoint     passT0 = now();
@@ -712,31 +737,32 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		uint64_t            passTrunc = 0;
 		uint64_t            passJobs  = 0;  // 実際に評価し終えたジョブ数(破棄時も数える)
 		if (nWorkers > 1) {
-			std::vector<std::vector<uint32_t>> sels(top.size());
-			for (size_t t = 0; t < top.size(); ++t)
-				sels[t] = pick_particles(legalIdx[top[t]], k2);
+			std::vector<std::vector<uint32_t>> sels(cur.size());
+			for (size_t t = 0; t < cur.size(); ++t)
+				sels[t] = pick_particles(legalIdx[cur[t]], k2);
 			std::vector<double> sum;
 			std::vector<size_t> cnt;
-			aborted = parallel_eval(top, sels, /*depth=*/d, nodesLimit2,
+			aborted = parallel_eval(cur, sels, /*depth=*/d, nodesLimit2,
 			                        /*abortable=*/true, sum, cnt, res.nodes, passTrunc);
-			for (size_t t = 0; t < top.size(); ++t)
+			for (size_t t = 0; t < cur.size(); ++t)
 				passJobs += cnt[t];
 			if (!aborted)
-				for (size_t t = 0; t < top.size(); ++t) {
-					size_t i = top[t];
+				for (size_t t = 0; t < cur.size(); ++t) {
+					size_t i = cur[t];
 					pass[i] = cnt[t] > 0 ? combined(i, sum[t] / double(cnt[t])) : comb1[i];
 				}
 		} else {
 			// 逐次版(stage1 と同じ理由で分けたまま。ブレースも同様)
-			for (size_t i : top) {
+			for (size_t i : cur) {
 				auto sel = pick_particles(legalIdx[i], k2);
 				double sum = 0;
 				size_t cnt = 0;
 				for (uint32_t j : sel) {
 					if (now() > s2Deadline) { aborted = true; break; }
-					sum += eval_one(parts[j]->pos, cands[i], /*depth=*/d,
-					                nodesLimit2, ctx_for(0), res.nodes, passTrunc);
-					++cnt;
+					bool ok = true;
+					double v = eval_one(parts[j]->pos, cands[i], /*depth=*/d,
+					                    nodesLimit2, ctx_for(0), res.nodes, passTrunc, ok);
+					if (ok) { sum += v; ++cnt; }
 				}
 				passJobs += cnt;
 				pass[i] = cnt > 0 ? combined(i, sum / double(cnt)) : comb1[i];
@@ -748,10 +774,14 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		// ジョブが少ない・1ms未満の観測は分解能のノイズが大きいので捨てる。
 		// 局面の複雑さの補正ぶんは割り戻して「標準的な局面での単価」として持つ。
 		const TimePoint passMs = now() - passT0;
-		if (d < Thinker::JOB_MS_SLOTS && passJobs >= 16 && passMs >= 2)
+		if (haveComplexity && d < Thinker::JOB_MS_SLOTS && passJobs >= 16 && passMs >= 2)
 			jobMs2_[d] = ema_update(jobMs2_[d], double(passMs) / double(passJobs) / complexity);
 		if (!aborted) {
-			// パスを完走したときだけ採用する(部分的な値で序列を壊さない)
+			// パスを完走したときだけ採用する(部分的な値で序列を壊さない)。
+			// 絞られた候補は最終選択の対象からも外れる: 浅いパスの値と深いパスの
+			// 値を同じ土俵で比べると、深く読んで下がった本命より浅い値の残った
+			// 脇の手が勝ってしまう
+			top = std::move(cur);
 			for (size_t i : top)
 				comb2[i] = pass[i];
 			depthDone    = d;
@@ -763,13 +793,14 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		} else {
 			if (cfg.logLevel >= 2)
 				fprintf(stderr, "abort d=%d t=%lld s2dl=%lld top=%zu k2=%zu jobs=%llu s1=%lld cx=%.2f\n", d,
-				        (long long)(now() - t0), (long long)(s2Deadline - t0), top.size(), k2,
+				        (long long)(now() - t0), (long long)(s2Deadline - t0), cur.size(), k2,
 				        (unsigned long long)passJobs, (long long)res.stage1Ms, complexity);
 			break;
 		}
 	}
 	res.depthReached = depthDone;
 	res.stage2Ms     = now() - tStage2;
+	res.badJobs      = badJobs.load();
 
 	// 6) 最終選択(同点付近は乱数タイブレーク)
 	double best = -1e18;
