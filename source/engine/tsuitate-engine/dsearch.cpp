@@ -43,20 +43,25 @@ struct ScoredMove {
 	Move m;
 };
 
-// スコア降順の**安定**ソート(挿入ソート)。同点は生成順を保つ。
+// i 番目に試す手を [i, n) から選んで位置 i に置く(遅延の安定選択)。
 //
 // 同点手の並びは探索木の大きさを大きく動かす(std::sort(不安定)から stable_sort に
 // 変えただけで深さ6のノード数が +47% 動いた)ので、順序は「スコア降順・同点は生成順」
 // と**定義**しておき、bench の hash で木の同一性を検査できるようにする。
-// 生成される手はスコアが少数の値(0 / 成り300 / 捕獲)に固まるので、
-// 挿入ソートの実コストは転倒数に比例して小さい。
-inline void sort_desc_stable(ScoredMove* b, ScoredMove* e) {
-	for (ScoredMove* p = b + 1; p < e; ++p) {
-		const ScoredMove tmp = *p;
-		ScoredMove*      q   = p;
-		for (; q != b && (q - 1)->s < tmp.s; --q)
-			*q = *(q - 1);
-		*q = tmp;
+// 残りから最大(同点は先のもの)を選び、[i, k) を1つずらして置くので、残りの相対順は
+// 保たれ、生成される列は安定ソートと同一。全体をソートしないので、最初の数手で
+// βカットする内部ノードでは O(n) で済む(history(hist 既定オン)で quiet 手の
+// スコアが散ると挿入ソートは転倒数ぶん O(n²) に寄る)。
+inline void pick_stable(ScoredMove* m, int i, int n) {
+	int k = i;
+	for (int j = i + 1; j < n; ++j)
+		if (m[j].s > m[k].s)
+			k = j;
+	if (k != i) {
+		const ScoredMove t = m[k];
+		for (int j = k; j > i; --j)
+			m[j] = m[j - 1];
+		m[i] = t;
 	}
 }
 
@@ -113,7 +118,7 @@ Value value_from_tt(int16_t v, int ply) {
 
 Value DSearch::qsearch(Position& pos, Value alpha, Value beta, int ply) {
 	++nodes;
-	if (ply >= MAX_PLY || nodes > nodesLimit)
+	if (ply >= MAX_PLY || nodes > nodesLimit || out_of_time())
 		return Eval::evaluate(pos);
 
 	const bool inCheck = pos.in_check();
@@ -152,9 +157,8 @@ Value DSearch::qsearch(Position& pos, Value alpha, Value beta, int ply) {
 	if (inCheck && n == 0)
 		return mated_in(ply);
 
-	sort_desc_stable(moves, moves + n);
-
 	for (int i = 0; i < n; ++i) {
+		pick_stable(moves, i, n);
 		const Move m = moves[i].m;
 		StateInfo  st;
 		pos.do_move(m, st);
@@ -389,7 +393,7 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 	if (depth <= 0)
 		return qsearch(pos, alpha, beta, ply);
 	++nodes;
-	if (ply >= MAX_PLY || nodes > nodesLimit)
+	if (ply >= MAX_PLY || nodes > nodesLimit || out_of_time())
 		return Eval::evaluate(pos);
 
 	// 相手ノードの非千里眼モデル。mate_1ply より前に分岐すること:
@@ -469,11 +473,10 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 	if (n == 0)
 		return mated_in(ply);  // 合法手なし = 負け(ステイルメイト含む)
 
-	sort_desc_stable(moves, moves + n);
-
 	Value best = -VALUE_INFINITE;
 	Move  bestMove = Move::none();
 	for (int i = 0; i < n; ++i) {
+		pick_stable(moves, i, n);
 		const Move m = moves[i].m;
 		StateInfo  st;
 		pos.do_move(m, st);

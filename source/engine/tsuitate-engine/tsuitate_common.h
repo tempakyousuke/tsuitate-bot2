@@ -323,6 +323,10 @@ struct Config {
 	// なる高予算ほど効く。200ms(深さ2が主)では表のプローブと history 更新の
 	// 定数コスト(knps −10%)が利得を食って中立(3.4章)なので、低予算では従来どおり
 	// 使わない。
+	//
+	// **`tt 0` は「表なし」であって「§10 以前の素の探索」ではない**: オーダリングは
+	// hist(既定1)に従う。3.4章・9章の対照(素の MVV-LVA)を再現するには `hist 0` も要る。
+	// 表の大きさは全ワーカー合計 128MB を上限にワーカー数から決める(SearchContext)。
 	int  tt             = -1;
 	int  ttAutoMs       = 1500;
 	// killer/history オーダリング(置換表なし)。tt=1 は表+オーダリングの合成なので、
@@ -394,8 +398,12 @@ struct Config {
 	// ほとんど使われなかった(1手3秒 = increment と同額しか使わず銀行が減らない)。
 	// 計算資源の価値は実測済み(3.4章: 4倍で61.7%、9.6章: 2倍で+10pp)なので、
 	// 銀行を序中盤に前倒しで配る(手数が進むほど残額に比例して減る幾何配分)。
-	int    tmHorizon = 30;
-	int    tmMaxMs   = 12000;
+	// 予算は常に「残り時間 − tmReserveMs」を超えない(ブリッジの往復と同期の超過の余白)。
+	// 残り時間が少ないときは銀行の1割まで(inc によらず連続。inc=3000 なら36秒で
+	// 上の式と交わる)。tmMaxMs の下限は 300(平常時の予算の下限と同じ。パーサが保証)
+	int    tmHorizon   = 30;
+	int    tmMaxMs     = 12000;
+	int    tmReserveMs = 500;
 
 	// §4 prior較正: fast_policy_score の重み表を切り替える。
 	//   0 = 手書き(POLICY_W_HAND。従来と完全に同一)
@@ -569,6 +577,20 @@ int effective_threads(const Config& cfg);
 // 実効スレッド数と同じ場所で解決することで「threads>1 ⇔ syncpct 55」の対が
 // どの起動経路(ブリッジ・アリーナ・直接USI)でも外れないようにする。
 int resolved_sync_pct(const Config& cfg);
+
+// 探索コンテキスト(置換表 / killer・history)を使うかの解決。**定義はここ1つ**:
+// think() と bench が同じ規則で決める(bench だけ別の写像を持つと、bench の木と
+// 実対局の木が静かに食い違う)。
+//   ctx: SearchContext を付ける(killer/history が有効)
+//   tt : さらに置換表を引く(cfg.tt > 0、または auto(-1) で予算 ≥ ttAutoMs)
+struct CtxMode {
+	bool ctx;
+	bool tt;
+};
+inline CtxMode resolve_ctx_mode(const Config& cfg, int budgetMs) {
+	const bool tt = cfg.tt > 0 || (cfg.tt < 0 && budgetMs >= cfg.ttAutoMs);
+	return {tt || cfg.hist != 0, tt};
+}
 
 // run_workers + ワーカーごとの独立PRNG。ワーカーPRNGの導出規則の定義はここ1つ:
 //   nw <= 1 … shared(通常は呼び出し側の rng_)をそのまま渡す。基準乱数も引かず、

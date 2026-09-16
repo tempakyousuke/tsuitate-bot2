@@ -15,7 +15,7 @@
 //   go [mytime <ms>] [opptime <ms>] [inc <ms>] [budget <ms>]
 //                                          → bestmove <usi> | bestmove resign
 //   state                                  … デバッグ出力
-//   bench [games] [maxplies] [depth] [oppmodel] [tt]
+//   bench [games] [maxplies] [depth] [oppmodel] [mode]
 //                                          … 固定深さの探索スループットと木の同一性検査
 //   arena games <n> [p1 <kind>] [p2 <kind>] [budget <ms>] [seed <n>]
 //         [p1cfg <key> <val>] [p2cfg <key> <val>]
@@ -157,7 +157,9 @@ bool set_config_key(Config& c, const std::string& key, const std::string& val) {
 	else if (key == "hist")         apply_i(c.hist, 0, 1);
 	else if (key == "nlpct")        apply_d(c.nodesLimitPct, 0.0, 100.0);
 	else if (key == "tmhorizon")    apply_i(c.tmHorizon, 1, 1000);
-	else if (key == "tmmax")        apply_i(c.tmMaxMs, 200, 600000);
+	// 下限 300 = 平常時の予算の下限(cmd_go)。それ未満を受け付けると床に黙って負ける
+	else if (key == "tmmax")        apply_i(c.tmMaxMs, 300, 600000);
+	else if (key == "tmreserve")    apply_i(c.tmReserveMs, 0, 60000);
 	// §9 stage2 スケジューリング
 	else if (key == "passgate")     apply_i(c.passGate, 0, 1);
 	else if (key == "passgrowth")   apply_d(c.passGrowth, 1.0, 100.0);
@@ -311,16 +313,14 @@ void cmd_bench(long long games, long long maxPlies, long long depth, long long o
 	PRNG rng(20260916);
 	Config cfg;
 	cfg.oppModel = int(oppModel);
-	// tt: 0 = 素の探索 / 1 = 置換表+killer/history / 2 = killer/history だけ(表なし)。
-	// 局面ごとに世代を進める(think() が (候補,粒子) ジョブをまたいで持ち越すのと
-	// 同じ使い方)
+	// mode: 0 = 素の探索(hist 0 / tt 0) / 1 = 置換表+killer/history(tt 1) /
+	// 2 = killer/history だけ(hist 1 / tt 0)。Config に写してから think() と同じ
+	// resolve_ctx_mode で解決する(bench だけ別の写像を持たない)。
+	// コンテキストは**局面ごとに作り直す**: 使い回すと表の中身と世代(uint8)が
+	// 前の局面に依存し、hash が「局面ごとの木の同一性」でなくなる
 	cfg.tt   = tt == 1 ? 1 : 0;
 	cfg.hist = tt == 2 ? 1 : 0;
-	std::unique_ptr<SearchContext> ctx;
-	if (tt > 0) {
-		ctx        = std::make_unique<SearchContext>();
-		ctx->useTT = tt == 1;
-	}
+	const CtxMode cm = resolve_ctx_mode(cfg, /*budgetMs=*/1 << 30);
 	long long positions = 0;
 	uint64_t  nodes     = 0;
 	uint64_t  hash      = 1469598103934665603ull;  // FNV-1a の初期値
@@ -342,7 +342,10 @@ void cmd_bench(long long games, long long maxPlies, long long depth, long long o
 				ds.nodesLimit = uint64_t(1) << 40;  // 打ち切りなし(木の同一性を測るため)
 				ds.cfg        = &cfg;
 				ds.us         = pos.side_to_move();
-				if (ctx) {
+				std::unique_ptr<SearchContext> ctx;
+				if (cm.ctx) {
+					ctx        = std::make_unique<SearchContext>();
+					ctx->useTT = cm.tt;
 					ctx->begin_think(0);
 					ds.ctx = ctx.get();
 				}
@@ -477,8 +480,9 @@ private:
 				cmd_check_policy(games, plies);
 		}
 		else if (cmd == "bench") {
-			// bench [games] [maxplies] [depth] [oppmodel] — 固定深さの探索スループット
-			// と木の同一性検査(cmd_bench 参照)。引数の検証規約は checkintents と同じ。
+			// bench [games] [maxplies] [depth] [oppmodel] [mode] — 固定深さの探索
+			// スループットと木の同一性検査(cmd_bench 参照。mode: 0 素 / 1 表+hist /
+			// 2 hist のみ)。引数の検証規約は checkintents と同じ。
 			long long games = 40, plies = 120, depth = 4, oppModel = 0, tt = 0;
 			bool bad = false;
 			auto arg = [&](const char* name, long long lo, long long hi, long long& out) {
@@ -636,12 +640,15 @@ private:
 				// 使われなかった)。銀行は残額に比例して減る幾何配分なので、
 				// 上限 tmMaxMs に当たるのは序盤だけ。
 				budget = inc * 4 / 5 + myTime / std::max(1, cfg_.tmHorizon);
+				// 平常時の下限 300 と上限 tmMaxMs(≥300 はパーサが保証するので順序は問わない)
 				budget = std::max(300L, std::min(budget, long(cfg_.tmMaxMs)));
-				// 残り時間が少ないときは絞る(銀行の1割まで。上の式と 36 秒で交わるので
-				// 段差なく繋がる。increment だけでは賄えない超過が続いても、
-				// 銀行 ≈ 10 × (inc − 超過) で釣り合う)
-				if (myTime < 40000)
-					budget = std::min(budget, std::max(200L, myTime / 10));
+				// 残り時間が少ないときは銀行の1割まで。inc によらず連続(inc=3000 なら
+				// 上の式と 36 秒で交わる)。increment だけでは賄えない超過が続いても、
+				// 銀行 ≈ 10 × (inc − 超過) で釣り合う
+				budget = std::min(budget, std::max(200L, myTime / 10));
+				// 残り時間を超えない(ブリッジの往復・同期の超過ぶんを tmReserveMs 残す)。
+				// 上の床より優先: 残り 150ms で 200ms 考えたら時間切れになる
+				budget = std::min(budget, std::max(50L, myTime - long(cfg_.tmReserveMs)));
 			} else {
 				budget = cfg_.budgetMs;
 			}

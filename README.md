@@ -61,7 +61,7 @@ npm start
 | `TSUITATE_QUEUE_RETRY_MS` | `60000` | キュー参加拒否後の再試行間隔 |
 
 時計はフィッシャー300秒+3秒。思考予算は残り時間とincrementから毎手計算する:
-`budget = inc×0.8 + 残り時間/tmhorizon`(上限 `tmmax`、残り40秒未満は残り時間の1割まで)。
+`budget = inc×0.8 + 残り時間/tmhorizon`(上限 `tmmax`、残り時間の1割まで、かつ `残り時間 − tmreserve` まで)。
 序盤は12秒、以降は銀行の残額に比例して減る(docs/strengthening.md 10章)。
 以前は3秒で頭打ちだったため持ち時間の300秒がほぼ使われずに終わっていた。
 
@@ -72,10 +72,10 @@ npm start
 | `particles` | 256 | 粒子数の目標 |
 | `depth` | 8 | stage2の探索深さ上限。実対局の予算(3秒以上)では深さ6のパスが1秒前後で終わって残りを捨てていたので8に(docs/strengthening.md 10章)。200msでは深さ6にも届かないので低予算の挙動は変わらない |
 | `threads` | 1 | 思考のワーカースレッド数(粒子並列)。0=auto(使えるCPU数=ハードウェア並列度とcgroupクォータの小さいほう、上限16)。実効値は常に同じ基準でクランプされ、対局開始時のinfo行で報告される。ブリッジは未指定なら `threads 0` を送る |
-| `tt` | auto | 確定化探索の置換表(+killer/historyオーダリング)。スレッドごとに16MB使う。auto(-1)=1手の予算が `ttautoms`(既定1500ms)以上のときだけ有効。固定深さのベンチで深さ6のノード数を69%減らす(値は同一)が、200ms予算(深さ2が主)では定数コストが勝って中立(docs/strengthening.md 3.4章・10章) |
-| `hist` | 1 | killer/historyオーダリングだけ(置換表なし、スレッドごとに256KB)。固定深さのベンチで深さ4のノード数 −17%、深さ6 −49%(値は同一)。0で従来(MVV-LVA+成りのみ)に戻る(docs/strengthening.md 10章) |
+| `tt` | auto | 確定化探索の置換表(+killer/historyオーダリング)。auto(-1)=1手の予算が `ttautoms`(既定1500ms)以上のときだけ有効。固定深さのベンチで深さ6のノード数を69%減らす(値は同一)が、200ms予算(深さ2が主)では定数コストが勝って中立(docs/strengthening.md 3.4章・10章)。メモリはスレッドごとに16MB、全スレッド合計128MBを上限に縮める(16スレッドなら8MBずつ)。一度確保した表は予算が下がっても対局中は保持する。**`tt 0` は表なしであってオーダリングは `hist` に従う**。§10以前の素の探索に戻すには `hist 0` も要る |
+| `hist` | 1 | killer/historyオーダリングだけ(置換表なし、スレッドごとに256KB)。固定深さのベンチで深さ4のノード数 −17%、深さ6 −49%(値は同一)。0で従来(MVV-LVA+成りのみ)に戻る(docs/strengthening.md 10章)。注意: history はワーカーごとで粒子の割当が動的なので、`threads` が2以上だと同一seedでも実行ごとに手が変わりうる。seedからの再現(9.5章のようなクラッシュハント)には `hist 0` を付けること |
 | `nlpct` | 2.0 | stage2 の1ジョブが使ってよい予算の割合(%)。実効のノード上限は max(`nodeslimit2`, 予算ms × これ/100 × 5000)。200msでは従来どおり60000、3秒では30万。0で固定上限のまま |
-| `tmhorizon` / `tmmax` | 30 / 12000 | 実対局の時間管理(上記)。持ち時間の銀行を何手で配るかと、1手の予算の上限(ms) |
+| `tmhorizon` / `tmmax` / `tmreserve` | 30 / 12000 / 500 | 実対局の時間管理(上記)。持ち時間の銀行を何手で配るか、1手の予算の上限(ms、下限300)、残り時間から必ず残す余白(ms)。予算は常に `残り時間 − tmreserve` を超えない |
 | `passgate` | 0 | §9 探索予算のスケジューリング。1で stage2 の深いパスの開始を固定の「予算の60%」ゲートではなく、深さ別の1ジョブあたり実測時間(対局内で学習)× 実ジョブ数の予測で決める。最初のパスが収まらないときは粒子数を減らして読む(docs/strengthening.md 9章) |
 | `halving` | 0 | 1で stage2 のパスごとに候補を直前の序列で半分に絞る(12→6→3、下限2)。深いパスが安くなるぶん同じ予算で1段深く読める。絞られた候補は最終選択からも外れる |
 | `stage1pct` | 0 | stage1(全候補の粗い序列化)に使う予算の上限(%)。0=従来(固定24粒子)。指定すると1ジョブあたりの実測時間から収まる粒子数を選ぶ(下限2)。候補が100手を超える中盤で stage1 が予算の半分を食っていたのを抑える |
@@ -138,7 +138,7 @@ printf "arena games 12 budget 200 particles 128 p2 belief p1cfg foulbase 350\nqu
 ### 探索のベンチ(木の同一性とnps)
 
 ```sh
-printf "bench 12 120 4 0 0\nquit\n" | ./YaneuraOu-by-gcc   # [games] [maxplies] [depth] [oppmodel] [tt: 0/1=表+hist/2=histのみ]
+printf "bench 12 120 4 0 0\nquit\n" | ./YaneuraOu-by-gcc   # [games] [maxplies] [depth] [oppmodel] [mode: 0=素/1=表+hist/2=histのみ]
 # → info string bench positions=192 depth=4 ... nodes=... value_sum=... hash=... knps=...
 ```
 
