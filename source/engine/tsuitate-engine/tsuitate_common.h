@@ -158,7 +158,13 @@ struct Config {
 	int  stage1Samples  = 24;    // stage1(静止探索)に使う粒子数
 	int  stage2Samples  = 48;    // stage2(深い探索)に使う粒子数
 	int  stage2TopK     = 12;    // stage2に進める候補数
-	int  searchDepth    = 6;     // stage2の探索深さの上限(時間が尽きれば手前で打ち切る)
+	// stage2の探索深さの上限(時間が尽きれば手前で打ち切る)。
+	// 6 → 8(§10): 実対局の予算(3秒以上)では深さ6のパスが1秒前後で終わり、
+	// 残りの予算を捨てていた(2000ms で予算の1/3が未使用)。深さ8のパスは
+	// 序盤・終盤(候補が少なく木が小さい)で3秒に収まる。収まらないパスは従来どおり
+	// 締め切りで破棄されるだけで、200ms のアリーナ条件では深さ6にも届かないので
+	// 較正済みの低予算の挙動は変わらない。
+	int  searchDepth    = 8;
 	int  budgetMs       = 2000;  // 1手の思考予算の既定値(goで上書き可)
 	int  regenTries     = 4000;  // 粒子再生成のリプレイ試行上限
 	double policyTemp   = 120.0; // 相手手サンプリングのsoftmax温度(centipawn)
@@ -311,7 +317,25 @@ struct Config {
 	// 確定化探索の置換表 + killer/history オーダリング(§3.2)。0で従来どおり。
 	// stage2 の反復深化(d=2,4,6…)が同じ部分木を読み直すぶんが主な回収源。
 	// ワーカースレッドごとに 16MB(2^20エントリ)確保する。
-	int  tt             = 0;
+	//
+	// 既定 -1 = auto: 1手の予算が ttAutoMs 以上のときだけ有効。固定深さの bench
+	// (§10)では深さ4で −22%、深さ6で −69% のノード数(値は同一)で、探索が深く
+	// なる高予算ほど効く。200ms(深さ2が主)では表のプローブと history 更新の
+	// 定数コスト(knps −10%)が利得を食って中立(3.4章)なので、低予算では従来どおり
+	// 使わない。
+	//
+	// **`tt 0` は「表なし」であって「§10 以前の素の探索」ではない**: オーダリングは
+	// hist(既定1)に従う。3.4章・9章の対照(素の MVV-LVA)を再現するには `hist 0` も要る。
+	// 表の大きさは全ワーカー合計 128MB を上限にワーカー数から決める(SearchContext)。
+	int  tt             = -1;
+	int  ttAutoMs       = 1500;
+	// killer/history オーダリング(置換表なし)。tt=1 は表+オーダリングの合成なので、
+	// 表の効果とオーダリングの効果を分けて測るための軸。ワーカーごとの history は
+	// 256KB で、表(16MB)と違いキャッシュを汚さない。表が有効なときは無関係
+	// (表があればオーダリングも常に有効)。
+	// 既定1(§10): 固定深さの bench で深さ4 −17%、深さ6 −49% のノード数(値は同一)。
+	// 0 で従来(MVV-LVA+成りだけ、同点は生成順)に戻る。
+	int  hist           = 1;
 
 	// --- §9 stage2 のスケジューリング(探索予算の使い切り) ---
 	// 反復深化のパス(d=2,4,6…)をいつ始め、何手読むかの規則。従来(既定)は
@@ -358,6 +382,28 @@ struct Config {
 	// 静的評価を返して打ち切る(値は汚れる)。深さ4〜6の木はこの上限に当たりやすく、
 	// 「深さ4」が実質どこまで読めているかは trunc 診断で見ること。
 	int    nodesLimit2 = 60000;
+	// nodesLimitPct(§10): 1ジョブが使ってよい予算の割合(%)。実効の上限は
+	//   max(nodesLimit2, budgetMs × nodesLimitPct/100 × NODES_PER_MS)
+	// で、NODES_PER_MS は 1スレッドの実測 nps の目安(5000 nodes/ms)。
+	// 200ms では 4ms ぶん = 20k < 60k で従来どおり。3000ms では 300k、
+	// 12000ms では 1.2M になり、深さ6〜8のパスが 60k で3割前後打ち切られて
+	// 値が汚れていたのを予算に応じて解く。0 で固定上限のまま。
+	double nodesLimitPct = 2.0;
+
+	// --- 実対局の時間管理(cmd_go。アリーナは固定予算なので無関係) ---
+	// フィッシャー時計での1手の予算:
+	//   budget = inc × 0.8 + myTime / tmHorizon、上限 tmMaxMs
+	// tmHorizon は「持ち時間の銀行を何手で使い切るか」。従来は inc×0.8 + myTime/40
+	// を 3000ms で頭打ちにしていたため、300+3 の持ち時間300秒は対局を通じて
+	// ほとんど使われなかった(1手3秒 = increment と同額しか使わず銀行が減らない)。
+	// 計算資源の価値は実測済み(3.4章: 4倍で61.7%、9.6章: 2倍で+10pp)なので、
+	// 銀行を序中盤に前倒しで配る(手数が進むほど残額に比例して減る幾何配分)。
+	// 予算は常に「残り時間 − tmReserveMs」を超えない(ブリッジの往復と同期の超過の余白)。
+	// 残り時間が少ないときは銀行の1割まで(inc によらず連続。inc=3000 なら36秒で
+	// 上の式と交わる)。tmMaxMs の下限は 300(平常時の予算の下限と同じ。パーサが保証)
+	int    tmHorizon   = 30;
+	int    tmMaxMs     = 12000;
+	int    tmReserveMs = 500;
 
 	// §4 prior較正: fast_policy_score の重み表を切り替える。
 	//   0 = 手書き(POLICY_W_HAND。従来と完全に同一)
@@ -531,6 +577,20 @@ int effective_threads(const Config& cfg);
 // 実効スレッド数と同じ場所で解決することで「threads>1 ⇔ syncpct 55」の対が
 // どの起動経路(ブリッジ・アリーナ・直接USI)でも外れないようにする。
 int resolved_sync_pct(const Config& cfg);
+
+// 探索コンテキスト(置換表 / killer・history)を使うかの解決。**定義はここ1つ**:
+// think() と bench が同じ規則で決める(bench だけ別の写像を持つと、bench の木と
+// 実対局の木が静かに食い違う)。
+//   ctx: SearchContext を付ける(killer/history が有効)
+//   tt : さらに置換表を引く(cfg.tt > 0、または auto(-1) で予算 ≥ ttAutoMs)
+struct CtxMode {
+	bool ctx;
+	bool tt;
+};
+inline CtxMode resolve_ctx_mode(const Config& cfg, int budgetMs) {
+	const bool tt = cfg.tt > 0 || (cfg.tt < 0 && budgetMs >= cfg.ttAutoMs);
+	return {tt || cfg.hist != 0, tt};
+}
 
 // run_workers + ワーカーごとの独立PRNG。ワーカーPRNGの導出規則の定義はここ1つ:
 //   nw <= 1 … shared(通常は呼び出し側の rng_)をそのまま渡す。基準乱数も引かず、

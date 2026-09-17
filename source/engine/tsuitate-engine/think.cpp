@@ -278,17 +278,33 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	// (全ワーカー分のゼロ初期化と first-touch を1スレッドに直列に乗せない)。
 	const int nWorkers = effective_threads(cfg);
 	++thinkStamp_;
-	if (cfg.tt)
+	// tt の解決(-1 = auto: この手の予算が ttAutoMs 以上なら表を使う。Config 参照)。
+	// hist だけのときは表を確保しない(useTT=false)。useTT は手番ごとに変わりうる
+	// ので begin_think の前に毎回セットする(表の確保は SearchContext 側が初回だけ行う)
+	const CtxMode cm     = resolve_ctx_mode(cfg, budgetMs);
+	const bool    useTT  = cm.tt;
+	const bool    useCtx = cm.ctx;
+	// 表の大きさ: 全ワーカー合計が TT_TOTAL_MAX_MB を超えないように縮める
+	// (ブリッジは threads 0 = auto(最大16)を送るので、既定 16MB × 16 = 256MB に
+	// なりうる。16 ワーカーなら 8MB ずつ)。最初の確保の前に決める
+	int ttBits = SearchContext::TT_BITS_DEFAULT;
+	while (ttBits > SearchContext::TT_BITS_MIN
+	       && (size_t(1) << ttBits) * sizeof(TTEntry) * size_t(nWorkers)
+	              > (SearchContext::TT_TOTAL_MAX_MB << 20))
+		--ttBits;
+	if (useCtx)
 		while (int(ctx_.size()) < nWorkers)
 			ctx_.push_back(std::make_unique<SearchContext>());
 	auto ctx_for = [&](int w) -> SearchContext* {
-		if (!cfg.tt)
+		if (!useCtx)
 			return nullptr;
 		SearchContext* c = ctx_[size_t(w)].get();
 		// コンテキストは1リージョン内では担当ワーカーだけが触り、リージョン間は
 		// run_workers の join が順序づけるので、素の比較で足りる(競合しない)。
 		if (c->stamp != thinkStamp_) {
-			c->stamp = thinkStamp_;
+			c->stamp  = thinkStamp_;
+			c->useTT  = useTT;
+			c->ttBits = ttBits;
 			c->begin_think(view.oppFouls);
 		}
 		return c;
@@ -329,9 +345,9 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	};
 
 	// stage2 の締め切り(パスの破棄判定)= 締め切りの s2MarginMs 手前(既定50)。
-	// passGate とは独立のつまみ(Config 参照)。ジョブは nodesLimit2 でしか止まらない
-	// ので、余白より長いジョブが直前に始まれば締め切りを超過しうる(高々1ジョブぶん。
-	// 並列時はワーカー数ぶん同時に)。
+	// passGate とは独立のつまみ(Config 参照)。走行中のジョブも DSearch::deadline で
+	// この時刻に打ち切られる(1024ノードごとに時計を見る)ので、超過は高々その粒度。
+	// 締め切りで打ち切られたジョブの値は汚れているので、そのパスは破棄する
 	const TimePoint s2Deadline = deadline - cfg.s2MarginMs;  // 範囲は set_config_key が保証
 
 	// (候補手, 粒子) 1ジョブの評価。並列(parallel_eval)・逐次(stage1/stage2)の
@@ -342,14 +358,17 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	// stage1 を千里眼qsearchのままにすると「進めた駒は必ず取られる」序列で
 	// 上位が決まり、相手モデルが評価したい前進手が stage2 に届かない(Config参照)。
 	// truncOut: ノード上限に当たって値が汚れたジョブ数(§9 診断。stage2 だけ集計する)
+	// jobDeadline: 0 以外なら探索の途中でも打ち切る壁時計(stage2 の s2Deadline)。
+	//   打ち切られたら *timedOut を立てる(呼び出し側はパスを破棄する)
 	// 返り値 nullopt = 評価していない(呼び出し側はこのジョブを数えない)
 	std::atomic<uint64_t> badJobs{0};
 	auto eval_one = [&](Position& pos, uint32_t j, Move m, int depth, uint64_t nodesLimit,
-	                    SearchContext* sctx, uint64_t& nodesOut,
-	                    uint64_t& truncOut) -> std::optional<double> {
+	                    SearchContext* sctx, TimePoint jobDeadline, bool* timedOut,
+	                    uint64_t& nodesOut, uint64_t& truncOut) -> std::optional<double> {
 		StateInfo st;
 		DSearch   ds;
 		ds.nodesLimit = nodesLimit;
+		ds.deadline   = jobDeadline;
 		ds.cfg        = &cfg;
 		ds.us         = view.us;
 		ds.foulGain   = foulGain;
@@ -379,6 +398,8 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 		nodesOut += ds.nodes;
 		if (ds.truncated())
 			++truncOut;
+		if (timedOut && ds.timedOut)
+			*timedOut = true;
 		// 相手ノードが確率混合を返したときは、その値は既に squash 済みの空間に
 		// いるので二重に squash しない(詰みが通常評価の上限に潰れる)。
 		return ds.rootMixed ? double(v) : squash_cp(v);
@@ -545,8 +566,15 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 						if (have > 0 && size_t(have) >= stage1_cap(now()))
 							continue;
 					}
+					bool       timedOut = false;
 					const auto v = eval_one(pos, j, cands[candIdx[c]], depth, nodesLimit,
-					                        sctx, myNodes, myTrunc);
+					                        sctx, abortable ? s2Deadline : TimePoint(0),
+					                        &timedOut, myNodes, myTrunc);
+					if (timedOut) {
+						// 締め切りで途中打ち切り = 値が汚れている。完了に数えず、パスを破棄
+						aborted.store(true, std::memory_order_relaxed);
+						break;
+					}
 					if (!v)
 						continue;  // 評価していないジョブは完了に数えない
 					vals[offset[g] + q] = *v;
@@ -615,7 +643,8 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 			size_t cnt = 0;
 			for (uint32_t j : sel)
 				if (auto v = eval_one(parts[j]->pos, j, cands[i], /*depth=*/0,
-				                      /*nodesLimit=*/20000, ctx_for(0), res.nodes, trunc1)) {
+				                      /*nodesLimit=*/20000, ctx_for(0), /*jobDeadline=*/0,
+				                      /*timedOut=*/nullptr, res.nodes, trunc1)) {
 					sum += *v;
 					++cnt;
 				}
@@ -665,7 +694,13 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 	// 従来と同一: 予算の60%を過ぎていたら次のパスを始めず、毎パス同じ候補集合を
 	// stage2Samples 粒子で読み直す。
 	const int      step        = cfg.depthStep;              // 1..2(set_config_key が保証)
-	const uint64_t nodesLimit2 = uint64_t(cfg.nodesLimit2);
+	// 1ジョブのノード上限。予算に比例した上限(Config::nodesLimitPct)と固定上限の
+	// 大きいほう。NODES_PER_MS は1スレッドの実測 nps の目安(bench で 5〜6M nps)。
+	// 実効 nps がこれより低くても、壁時計の締め切りは DSearch::deadline が別に守る
+	constexpr double NODES_PER_MS = 5000.0;
+	const uint64_t nodesLimit2 = std::max<uint64_t>(
+	    uint64_t(cfg.nodesLimit2),
+	    uint64_t(double(budgetMs) * cfg.nodesLimitPct / 100.0 * NODES_PER_MS));
 	TimePoint      lastPassMs  = 0;  // 直前に完走したパスの所要時間
 	uint64_t       lastPassJobs = 0; // そのジョブ数
 	// この深さの1ジョブあたり wall 時間の推定(ms)。
@@ -773,8 +808,11 @@ ThinkResult Thinker::think(const OwnView& view, Belief& belief, const GameHistor
 				size_t cnt = 0;
 				for (uint32_t j : sel) {
 					if (now() > s2Deadline) { aborted = true; break; }
-					if (auto v = eval_one(parts[j]->pos, j, cands[i], /*depth=*/d,
-					                      nodesLimit2, ctx_for(0), res.nodes, passTrunc)) {
+					bool timedOut = false;
+					auto v = eval_one(parts[j]->pos, j, cands[i], /*depth=*/d, nodesLimit2,
+					                  ctx_for(0), s2Deadline, &timedOut, res.nodes, passTrunc);
+					if (timedOut) { aborted = true; break; }
+					if (v) {
 						sum += *v;
 						++cnt;
 					}

@@ -64,13 +64,15 @@ struct ArenaStats {
 	// 探索スループット(§3.1/§3.2の採用ゲート用)。決定ごとに集計する。
 	long long nodesSum = 0, thinkMsSum = 0, depthSum = 0;
 	// §9 stage2 スケジューリング診断(決定ごと)。
-	//   depthHist[d]: stage2 の完了深さ d の決定数(7以上は7にまとめる)
+	//   depthHist[d]: stage2 の完了深さ d の決定数(幅は Config::kMaxSearchDepth に
+	//     連動。Thinker::JOB_MS_SLOTS と同じ由来で、深さ上限を上げても再編集不要)
 	//   jobs2/trunc2: stage2 ジョブ数とノード上限で汚れたジョブ数
 	//   gateSkipped : 深いパスが残っていたのに開始ゲートで止めた決定数
-	long long depthHist[8] = {};
+	static constexpr int DIAG_DEPTH_MAX = Config::kMaxSearchDepth;
+	long long depthHist[DIAG_DEPTH_MAX + 1] = {};
 	long long jobs2 = 0, trunc2 = 0, gateSkipped = 0;
-	// 深さ d のパスの所要時間の合計と本数(passgrowth の較正用。7以上は7)
-	long long passMsSum[8] = {}, passCnt[8] = {};
+	// 深さ d のパスの所要時間の合計と本数(passgrowth の較正用。幅は depthHist と同じ)
+	long long passMsSum[DIAG_DEPTH_MAX + 1] = {}, passCnt[DIAG_DEPTH_MAX + 1] = {};
 	long long syncMsSum = 0, stage1MsSum = 0, stage2MsSum = 0;  // 予算内訳(決定ごと)
 	long long candsSum = 0, jobs1Sum = 0;  // 候補数と stage1 ジョブ数(決定ごと)
 	// 9.5章: 信念が不正として捨てた粒子(局ごとの累計の差分を choose で足す)と
@@ -102,7 +104,7 @@ struct ArenaStats {
 		if (r.cands == 0)
 			return;  // 探索していない決定(投了・粒子ゼロ)。以下の分母には入れない
 		searched++;
-		depthHist[std::clamp(r.depthReached, 0, 7)]++;
+		depthHist[std::clamp(r.depthReached, 0, DIAG_DEPTH_MAX)]++;
 		jobs2       += (long long) r.jobs2;
 		trunc2      += (long long) r.trunc2;
 		gateSkipped += r.gateSkipped;
@@ -111,8 +113,8 @@ struct ArenaStats {
 		candsSum    += (long long) r.cands;
 		jobs1Sum    += (long long) r.jobs1;
 		for (auto& [d, ms] : r.passes) {
-			passMsSum[std::clamp(d, 0, 7)] += ms;
-			passCnt[std::clamp(d, 0, 7)]++;
+			passMsSum[std::clamp(d, 0, DIAG_DEPTH_MAX)] += ms;
+			passCnt[std::clamp(d, 0, DIAG_DEPTH_MAX)]++;
 		}
 	}
 	void add_turn(const ThinkResult& r) {
@@ -600,18 +602,20 @@ void run_arena(const ArenaOptions& opt) {
 		std::cout << " avg_depth=" << (double(g.depthSum) / double(g.decisions))
 		          << " knps=" << (g.thinkMsSum > 0
 		                              ? double(g.nodesSum) / double(g.thinkMsSum) : 0.0);
-		// §9 stage2 スケジューリング診断。depth_hist は完了深さ 0..6 の決定数と 7+。
-		// trunc2 は「stage2 のジョブのうちノード上限で値が汚れた割合」で、
-		// avg_depth が同じでも読めている中身が違うことを検出する。
 		// §9 stage2 スケジューリング診断(分母は探索まで進んだ決定 searched=)。
-		// depth_hist は完了深さ 0..6 の決定数と 7+。trunc2 は「stage2 のジョブのうち
+		// depth_hist は完了深さ別の決定数(0 から、最後の非ゼロまで。最低 0..8)。
+		// trunc2 は「stage2 のジョブのうち
 		// ノード上限で値が汚れた割合」で、avg_depth が同じでも読めている中身が違う
 		// ことを検出する。pass_ms は深さ別のパス平均所要時間(ms、passgrowth の目安)
 		const double S = double(std::max<long long>(1, g.searched));
 		std::vector<std::string> dh, pm;
-		for (int d = 0; d < 8; ++d)
+		int dMax = 8;  // 既定の深さ上限まではゼロでも出す(列の位置で読めるように)
+		for (int d = dMax + 1; d <= ArenaStats::DIAG_DEPTH_MAX; ++d)
+			if (g.depthHist[d])
+				dMax = d;
+		for (int d = 0; d <= dMax; ++d)
 			dh.push_back(std::to_string(g.depthHist[d]));
-		for (int d = 0; d < 8; ++d)
+		for (int d = 0; d <= ArenaStats::DIAG_DEPTH_MAX; ++d)
 			if (g.passCnt[d])
 				pm.push_back(std::to_string(d) + ":"
 				             + std::to_string(double(g.passMsSum[d]) / double(g.passCnt[d]))

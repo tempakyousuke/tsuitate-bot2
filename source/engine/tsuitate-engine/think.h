@@ -77,7 +77,8 @@ public:
 
 private:
 	// §3.2 ワーカースレッドごとの探索コンテキスト(置換表 + history)。
-	// cfg.tt != 0 のときだけ確保する。手番をまたいで保持し、世代で無効化する
+	// hist(既定オン)または tt(auto: 予算で解決)が有効なときだけ確保する。
+	// 手番をまたいで保持し、世代で無効化する
 	// (詳細は dsearch.h の SearchContext)。
 	std::vector<std::unique_ptr<SearchContext>> ctx_;
 	// think() の通し番号。SearchContext::stamp と突き合わせて

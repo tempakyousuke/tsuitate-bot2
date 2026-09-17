@@ -17,6 +17,10 @@ namespace Tsuitate {
 namespace {
 
 // 簡易ムーブオーダリング: 捕獲(MVV-LVA)＞成り＞その他
+//
+// quiet 手(スコア0)の同点の並びは生成順(歩→…→玉→打ち)。静的な並べ替え
+// (王手を先に / 軽い駒を先に)は ctx なしの経路では深さ6のノード数を最大36%減らすが、
+// killer/history(Config::hist、既定オン)の下ではほぼ効かない(§10 の表)ので入れていない。
 int order_score(const Position& pos, Move m) {
 	int s = 0;
 	if (!m.is_drop()) {
@@ -27,6 +31,38 @@ int order_score(const Position& pos, Move m) {
 			s += 300;
 	}
 	return s;
+}
+
+// ノードごとの指し手バッファ。以前は std::vector<std::pair<int, Move>> を
+// ノードごとに構築していて、malloc/free が探索の命令数の約8%を占めていた
+// (callgrind)。スタック上の固定配列に置き換える(MAX_MOVES=600 × 8B = 4.8KB/フレーム。
+// search の深さは高々十数、qsearch は捕獲の連鎖ぶんなので、ワーカースレッドの
+// 8MB スタックには余裕がある)。
+struct ScoredMove {
+	int  s;
+	Move m;
+};
+
+// i 番目に試す手を [i, n) から選んで位置 i に置く(遅延の安定選択)。
+//
+// 同点手の並びは探索木の大きさを大きく動かす(std::sort(不安定)から stable_sort に
+// 変えただけで深さ6のノード数が +47% 動いた)ので、順序は「スコア降順・同点は生成順」
+// と**定義**しておき、bench の hash で木の同一性を検査できるようにする。
+// 残りから最大(同点は先のもの)を選び、[i, k) を1つずらして置くので、残りの相対順は
+// 保たれ、生成される列は安定ソートと同一。全体をソートしないので、最初の数手で
+// βカットする内部ノードでは O(n) で済む(history(hist 既定オン)で quiet 手の
+// スコアが散ると挿入ソートは転倒数ぶん O(n²) に寄る)。
+inline void pick_stable(ScoredMove* m, int i, int n) {
+	int k = i;
+	for (int j = i + 1; j < n; ++j)
+		if (m[j].s > m[k].s)
+			k = j;
+	if (k != i) {
+		const ScoredMove t = m[k];
+		for (int j = k; j > i; --j)
+			m[j] = m[j - 1];
+		m[i] = t;
+	}
 }
 
 // 確率混合の中で使う飽和。
@@ -82,7 +118,7 @@ Value value_from_tt(int16_t v, int ply) {
 
 Value DSearch::qsearch(Position& pos, Value alpha, Value beta, int ply) {
 	++nodes;
-	if (ply >= MAX_PLY || nodes > nodesLimit)
+	if (ply >= MAX_PLY || nodes > nodesLimit || out_of_time())
 		return Eval::evaluate(pos);
 
 	const bool inCheck = pos.in_check();
@@ -103,28 +139,28 @@ Value DSearch::qsearch(Position& pos, Value alpha, Value beta, int ply) {
 	}
 
 	// 王手時は全応手、平時は捕獲のみ
-	std::vector<std::pair<int, Move>> moves;
+	ScoredMove moves[MAX_MOVES];
+	int        n = 0;
 	if (inCheck) {
 		for (auto ext : MoveList<EVASIONS_ALL>(pos)) {
 			Move m = ext;
 			if (pos.legal(m))
-				moves.emplace_back(order_score(pos, m), m);
+				moves[n++] = {order_score(pos, m), m};
 		}
 	} else {
 		for (auto ext : MoveList<CAPTURES_ALL>(pos)) {
 			Move m = ext;
 			if (pos.legal(m))
-				moves.emplace_back(order_score(pos, m), m);
+				moves[n++] = {order_score(pos, m), m};
 		}
 	}
-	if (inCheck && moves.empty())
+	if (inCheck && n == 0)
 		return mated_in(ply);
 
-	std::sort(moves.begin(), moves.end(),
-	          [](const auto& a, const auto& b) { return a.first > b.first; });
-
-	for (auto& [s, m] : moves) {
-		StateInfo st;
+	for (int i = 0; i < n; ++i) {
+		pick_stable(moves, i, n);
+		const Move m = moves[i].m;
+		StateInfo  st;
 		pos.do_move(m, st);
 		Value v = -qsearch(pos, -beta, -alpha, ply + 1);
 		pos.undo_move(m);
@@ -357,7 +393,7 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 	if (depth <= 0)
 		return qsearch(pos, alpha, beta, ply);
 	++nodes;
-	if (ply >= MAX_PLY || nodes > nodesLimit)
+	if (ply >= MAX_PLY || nodes > nodesLimit || out_of_time())
 		return Eval::evaluate(pos);
 
 	// 相手ノードの非千里眼モデル。mate_1ply より前に分岐すること:
@@ -377,7 +413,7 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 	const Value alphaOrig = alpha;
 	uint16_t    ttRaw     = 0;
 	TTEntry*    tte       = nullptr;
-	if (ctx) {
+	if (ctx && ctx->useTT) {
 		tte = &ctx->slot(pos.key());
 		if (tte->key == pos.key()) {
 			ttRaw = tte->move16;
@@ -406,7 +442,8 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 		return !m.is_drop() && pos.piece_on(m.to_sq()) != NO_PIECE;
 	};
 
-	std::vector<std::pair<int, Move>> moves;
+	ScoredMove moves[MAX_MOVES];
+	int        n = 0;
 	for (auto ext : MoveList<LEGAL_ALL>(pos)) {
 		Move m = ext;
 		int  s;
@@ -431,18 +468,17 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 					s += 300;
 			}
 		}
-		moves.emplace_back(s, m);
+		moves[n++] = {s, m};
 	}
-	if (moves.empty())
+	if (n == 0)
 		return mated_in(ply);  // 合法手なし = 負け(ステイルメイト含む)
-
-	std::sort(moves.begin(), moves.end(),
-	          [](const auto& a, const auto& b) { return a.first > b.first; });
 
 	Value best = -VALUE_INFINITE;
 	Move  bestMove = Move::none();
-	for (auto& [s, m] : moves) {
-		StateInfo st;
+	for (int i = 0; i < n; ++i) {
+		pick_stable(moves, i, n);
+		const Move m = moves[i].m;
+		StateInfo  st;
 		pos.do_move(m, st);
 		Value v = -search(pos, depth - 1, -beta, -alpha, ply + 1);
 		pos.undo_move(m);
@@ -473,7 +509,7 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 	// nodesLimit を超えた探索は途中で静的評価を返しており値が汚れているので書かない。
 	// 置換は「同世代でより深い既存エントリ」だけを尊重し、それ以外は上書きする
 	// (旧世代はどれだけ深くても置き換え対象。世代が違う値はカットオフに使えないため)。
-	if (ctx && !truncated()) {
+	if (tte && !truncated()) {
 		const bool keep = tte->key == pos.key() && tte->gen == ctx->gen
 		                  && tte->depth > depth;
 		if (!keep) {

@@ -15,6 +15,8 @@
 //   go [mytime <ms>] [opptime <ms>] [inc <ms>] [budget <ms>]
 //                                          → bestmove <usi> | bestmove resign
 //   state                                  … デバッグ出力
+//   bench [games] [maxplies] [depth] [oppmodel] [mode]
+//                                          … 固定深さの探索スループットと木の同一性検査
 //   arena games <n> [p1 <kind>] [p2 <kind>] [budget <ms>] [seed <n>]
 //         [p1cfg <key> <val>] [p2cfg <key> <val>]
 //                                          … ローカル自己対戦(審判つき)。
@@ -30,6 +32,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -149,7 +152,14 @@ bool set_config_key(Config& c, const std::string& key, const std::string& val) {
 	// effective_threads が解決する。CPU数の自動判定はエンジンのここ1か所)。
 	else if (key == "threads")      apply_i(c.threads, 0, 64);
 	// 置換表 + killer/history オーダリング(§3.2)。0で従来どおり。
-	else if (key == "tt")           apply_i(c.tt, 0, 1);
+	else if (key == "tt")           apply_i(c.tt, -1, 1);   // -1 = auto(予算 ttautoms 以上で有効)
+	else if (key == "ttautoms")     apply_i(c.ttAutoMs, 0, 3600000);
+	else if (key == "hist")         apply_i(c.hist, 0, 1);
+	else if (key == "nlpct")        apply_d(c.nodesLimitPct, 0.0, 100.0);
+	else if (key == "tmhorizon")    apply_i(c.tmHorizon, 1, 1000);
+	// 下限 300 = 平常時の予算の下限(cmd_go)。それ未満を受け付けると床に黙って負ける
+	else if (key == "tmmax")        apply_i(c.tmMaxMs, 300, 600000);
+	else if (key == "tmreserve")    apply_i(c.tmReserveMs, 0, 60000);
 	// §9 stage2 スケジューリング
 	else if (key == "passgate")     apply_i(c.passGate, 0, 1);
 	else if (key == "passgrowth")   apply_d(c.passGrowth, 1.0, 100.0);
@@ -289,6 +299,73 @@ void cmd_check_policy(long long games, long long maxPlies) {
 	          << (mismatch == 0 ? "  OK (score == W·phi)" : "  FAILED") << sync_endl;
 }
 
+// 確定化探索のスループット計測(固定深さ・時間門なし)。
+//
+// ランダム局面(乱数の固定seed)で DSearch::search を固定深さで回し、
+// 総ノード数・値の和・(値, ノード数)列のハッシュ・所要時間を出す。
+// 用途は2つ:
+//   - **木を変えないはずの高速化**(割り当ての削減・オーダリングの実装差し替え)の
+//     検証: 前後で hash が一致すれば探索木は同一(値もノード数も一致)
+//   - nps の退行監視(アリーナの knps は時間門と粒子数に依存して比較しにくい)
+// oppmodel を渡せば相手ノード(opp_node)の経路も同じ規約で測れる。
+void cmd_bench(long long games, long long maxPlies, long long depth, long long oppModel,
+               long long tt) {
+	PRNG rng(20260916);
+	Config cfg;
+	cfg.oppModel = int(oppModel);
+	// mode: 0 = 素の探索(hist 0 / tt 0) / 1 = 置換表+killer/history(tt 1) /
+	// 2 = killer/history だけ(hist 1 / tt 0)。Config に写してから think() と同じ
+	// resolve_ctx_mode で解決する(bench だけ別の写像を持たない)。
+	// コンテキストは**局面ごとに作り直す**: 使い回すと表の中身と世代(uint8)が
+	// 前の局面に依存し、hash が「局面ごとの木の同一性」でなくなる
+	cfg.tt   = tt == 1 ? 1 : 0;
+	cfg.hist = tt == 2 ? 1 : 0;
+	const CtxMode cm = resolve_ctx_mode(cfg, /*budgetMs=*/1 << 30);
+	long long positions = 0;
+	uint64_t  nodes     = 0;
+	uint64_t  hash      = 1469598103934665603ull;  // FNV-1a の初期値
+	long long valueSum  = 0;
+	auto mix = [&](uint64_t x) { hash = (hash ^ x) * 1099511628211ull; };
+	const TimePoint t0 = now();
+	for (long long g = 0; g < games; ++g) {
+		Position pos;
+		std::deque<StateInfo> sts;
+		sts.emplace_back();
+		pos.set_hirate(&sts.back());
+		for (long long p = 0; p < maxPlies; ++p) {
+			MoveList<LEGAL_ALL> ml(pos);
+			if (ml.size() == 0)
+				break;
+			// 序盤10手は飛ばし、以降7手ごとに1局面を測る(同じ局の隣接局面は似すぎる)
+			if (p >= 10 && p % 7 == 0) {
+				DSearch ds;
+				ds.nodesLimit = uint64_t(1) << 40;  // 打ち切りなし(木の同一性を測るため)
+				ds.cfg        = &cfg;
+				ds.us         = pos.side_to_move();
+				std::unique_ptr<SearchContext> ctx;
+				if (cm.ctx) {
+					ctx        = std::make_unique<SearchContext>();
+					ctx->useTT = cm.tt;
+					ctx->begin_think(0);
+					ds.ctx = ctx.get();
+				}
+				const Value v = ds.search(pos, int(depth), -VALUE_INFINITE, VALUE_INFINITE, 0);
+				nodes    += ds.nodes;
+				valueSum += (long long) v;
+				mix(uint64_t((long long) v + 1000000));
+				mix(ds.nodes);
+				++positions;
+			}
+			pos.do_move(ml.at(rng.rand<uint64_t>() % ml.size()), sts.emplace_back());
+		}
+	}
+	const TimePoint ms = now() - t0;
+	sync_cout << "info string bench positions=" << positions << " depth=" << depth
+	          << " oppmodel=" << oppModel << " tt=" << tt << " nodes=" << nodes << " value_sum=" << valueSum
+	          << " hash=" << std::hex << hash << std::dec << " ms=" << ms
+	          << " knps=" << (ms > 0 ? double(nodes) / double(ms) : 0.0) << sync_endl;
+}
+
 class ProtocolLoop {
 public:
 	int run() {
@@ -401,6 +478,35 @@ private:
 				sync_cout << "info string checkpolicy aborted" << sync_endl;
 			else
 				cmd_check_policy(games, plies);
+		}
+		else if (cmd == "bench") {
+			// bench [games] [maxplies] [depth] [oppmodel] [mode] — 固定深さの探索
+			// スループットと木の同一性検査(cmd_bench 参照。mode: 0 素 / 1 表+hist /
+			// 2 hist のみ)。引数の検証規約は checkintents と同じ。
+			long long games = 40, plies = 120, depth = 4, oppModel = 0, tt = 0;
+			bool bad = false;
+			auto arg = [&](const char* name, long long lo, long long hi, long long& out) {
+				std::string v;
+				if (!(is >> v))
+					return false;
+				long long x = 0;
+				if (!parse_ll(v, x) || x < lo || x > hi) {
+					sync_cout << "info string bad bench option: " << name
+					          << " = " << v << " (" << lo << ".." << hi << ")" << sync_endl;
+					bad = true;
+					return false;
+				}
+				out = x;
+				return true;
+			};
+			if (arg("games", 1, 100000, games) && arg("maxplies", 1, 100000, plies)
+			    && arg("depth", 0, Config::kMaxSearchDepth, depth)
+			    && arg("oppmodel", 0, 2, oppModel))
+				arg("tt", 0, 2, tt);
+			if (bad)
+				sync_cout << "info string bench aborted" << sync_endl;
+			else
+				cmd_bench(games, plies, depth, oppModel, tt);
 		}
 		else
 			sync_cout << "info string unknown command: " << cmd << sync_endl;
@@ -528,12 +634,21 @@ private:
 		}
 		if (budget < 0) {
 			if (myTime >= 0) {
-				// フィッシャー時計: increment をほぼ使い切り、残り時間の一部を上乗せ
-				budget = inc * 4 / 5 + myTime / 40;
-				budget = std::max(300L, std::min(budget, 3000L));
-				// 残り時間が少ないときは絞る
-				if (myTime < 20000)
-					budget = std::max(200L, myTime / 20);
+				// フィッシャー時計: increment をほぼ使い切り(2割はブリッジの往復や
+				// 同期の超過ぶんの余白)、持ち時間の銀行を tmHorizon 手で配る
+				// (Config::tmHorizon 参照。旧式は 3000ms で頭打ちにしていて銀行が
+				// 使われなかった)。銀行は残額に比例して減る幾何配分なので、
+				// 上限 tmMaxMs に当たるのは序盤だけ。
+				budget = inc * 4 / 5 + myTime / std::max(1, cfg_.tmHorizon);
+				// 平常時の下限 300 と上限 tmMaxMs(≥300 はパーサが保証するので順序は問わない)
+				budget = std::max(300L, std::min(budget, long(cfg_.tmMaxMs)));
+				// 残り時間が少ないときは銀行の1割まで。inc によらず連続(inc=3000 なら
+				// 上の式と 36 秒で交わる)。increment だけでは賄えない超過が続いても、
+				// 銀行 ≈ 10 × (inc − 超過) で釣り合う
+				budget = std::min(budget, std::max(200L, myTime / 10));
+				// 残り時間を超えない(ブリッジの往復・同期の超過ぶんを tmReserveMs 残す)。
+				// 上の床より優先: 残り 150ms で 200ms 考えたら時間切れになる
+				budget = std::min(budget, std::max(50L, myTime - long(cfg_.tmReserveMs)));
 			} else {
 				budget = cfg_.budgetMs;
 			}
@@ -551,6 +666,7 @@ private:
 			          // 式は ThinkResult::knps() に一本化(アリーナ側と同じ定義)
 			          << " nodes=" << r.nodes
 			          << " knps=" << int(r.knps())
+			          << " budget=" << budget << "ms"
 			          << " time=" << r.elapsedMs << "ms" << sync_endl;
 		if (cfg_.logLevel >= 2) {
 			// §9 stage2 スケジューリングの診断(パスごとの所要時間・ノード上限打ち切り・
