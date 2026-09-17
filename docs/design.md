@@ -378,8 +378,9 @@ printf "arena games 12 budget 200 particles 128 p2 belief p1cfg foulbase 350\nqu
    盤上で決着する局が12局しかなく、勝敗は6勝6敗の互角。
    1手あたりの反則を2割減らしても総合は63%にとどまる。
    0番(探索側の千里眼バイアス)が最優先
-4. **探索が自前の簡易negamax** — やねうら王本体の`YaneuraOuWorker`(LMR・TT・history付き)を
-   粒子探索に使う配線は未着手。stage2の深さを上げるならこちらが本筋
+4. **探索が自前の簡易negamax** — やねうら王本体の`YaneuraOuWorker`を粒子探索に使う
+   配線は未着手。ただし TT・killer/history(strengthening.md 10章)、PVS・null move・
+   LMR・futility(同 11章)は自前の探索に移植済みで、固定深さの木は初版の 1/20 以下
 5. **並列化されていない** — 粒子はほぼ完全に独立なので、再生成も確定化探索も
    コア数ぶん並列にできる。実対局の予算(2.4秒/手)なら粒子数を数倍にできるはず
 6. **NNUE** — MaterialLv9で始めたが、NNUE評価(halfKP)に差し替え可能な構造。

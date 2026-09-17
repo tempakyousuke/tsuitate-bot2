@@ -279,7 +279,9 @@ CPPFLAGS  += -DUNICODE
 # em++ では strip: -Wl,-s の指定はしない
 ifeq (,$(findstring em++,$(COMPILER)))
 # stripの指示。(実行ファイルのサイズを小さく)
+ifeq ($(NOSTRIP),)
 LDFLAGS += -Wl,-s
+endif
 endif
 
 # mingw64では-D_WIN64,-D_WIN32は環境に応じて自動で設定されるので指定すべきではない。

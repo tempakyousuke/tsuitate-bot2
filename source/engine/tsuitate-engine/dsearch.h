@@ -166,6 +166,11 @@ struct DSearch {
 	// ※ DSearch は1回の探索につき1つ作る前提(think() がループ内で毎回作る)。
 	bool          rootMixed = false;
 
+	// §11 null move pruning の連続禁止: null move の直後のノード(ply+1)では
+	// もう一度 null move をしない(往復で手番だけ戻る無意味な木を防ぐ)。
+	// 再帰の前に立てて後で戻すので、1回の探索の中でだけ意味を持つ。
+	bool          nullBan = false;
+
 	// 手番側から見た評価値(centipawn相当, 詰みは±(32000-ply))を返す。
 	Value search(Position& pos, int depth, Value alpha, Value beta, int ply);
 	Value qsearch(Position& pos, Value alpha, Value beta, int ply);

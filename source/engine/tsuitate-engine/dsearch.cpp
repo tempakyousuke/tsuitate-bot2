@@ -404,6 +404,11 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 		return opp_node(pos, depth, ply);
 
 	const bool inCheck = pos.in_check();
+	// PVノード = 窓の幅が1より大きい。§11 の枝刈り(nmp / lmr / futility)は
+	// 非PVノードにだけ掛ける(PVS の null 窓で読んでいる枝が対象。全窓の枝は
+	// 値の精度を守る)。pvs 0 では全ノードが全窓なので、値を変える枝刈りは
+	// 一切働かない = 従来と同一の木
+	const bool pvNode = beta - alpha > 1;
 
 	// --- 置換表プローブ(§3.2。ctx == nullptr なら従来と完全に同一の経路) ---
 	//
@@ -434,6 +439,39 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 			return mate_in(ply + 1);
 	}
 #endif
+
+	// --- §11 値を変える枝刈り(非PVノード・王手されていないときだけ) ---
+	// 静的評価は nmp / futility のどちらかが要るときだけ計算する(MaterialLv9 は
+	// 利きまで見るので qsearch の stand pat と同程度のコスト)。
+	// null move の直後のノードだけ禁止(フラグは読んだら下ろす。下ろさないと
+	// null move の部分木全体で禁止が残り、深いところの枝刈りが働かない)
+	const bool  nullBanned = nullBan;
+	nullBan = false;
+	const bool  pruneOK   = cfg && !pvNode && !inCheck;
+	const bool  wantNmp   = pruneOK && cfg->nmp && depth >= 2 && !nullBanned;
+	const bool  wantFut   = pruneOK && cfg->futility > 0 && depth == 1;
+	Value       staticEval = VALUE_NONE;
+	if (wantNmp || wantFut)
+		staticEval = Eval::evaluate(pos);
+
+	// null move pruning: 手番を渡しても β 以上なら、このノードは β 以上とみなす。
+	// 詰みスコアは「証明されていない詰み」なので β に潰す(Stockfish と同じ規約)。
+	// ノード上限・締め切りで汚れた値でのカットは、どのみち親が truncated() で捨てる。
+	if (wantNmp && staticEval >= beta) {
+		const int R = cfg->nmpR + depth / 4;
+		StateInfo st;
+		pos.do_null_move(st);
+		nullBan = true;  // 子(search なら入口で下ろす。qsearch は読まないので下で下ろす)
+		Value v = -search(pos, depth - 1 - R, -beta, -beta + 1, ply + 1);
+		nullBan = false;
+		pos.undo_null_move();
+		if (v >= beta)
+			return v >= VALUE_MATE_IN_MAX_PLY ? beta : v;
+	}
+
+	// futility(フロンティア): 静的評価に余白を足しても α に届かないなら、
+	// 局面を大きく動かさない quiet 手は読まない(捕獲・成り・王手は読む)。
+	const bool  futile   = wantFut && staticEval + cfg->futility <= alpha;
 
 	// 捕獲判定(着手前の局面で評価する)。オーダリングの帯分けと killer/history の
 	// 更新条件の両方がこれを使う ―― 定義が2か所に割れると、片方だけ変えたときに
@@ -473,15 +511,52 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 	if (n == 0)
 		return mated_in(ply);  // 合法手なし = 負け(ステイルメイト含む)
 
+	const bool usePvs = cfg && cfg->pvs;
+	const bool useLmr = pruneOK && cfg->lmr && depth >= cfg->lmrDepth;
+
 	Value best = -VALUE_INFINITE;
 	Move  bestMove = Move::none();
+	int   searched = 0;  // 実際に読んだ手の数(PVS の「最初の手」と LMR の手数目)
 	for (int i = 0; i < n; ++i) {
 		pick_stable(moves, i, n);
 		const Move m = moves[i].m;
+		// 「局面を動かす手」= 捕獲・成り。quiet の判定は futility と LMR で共有する
+		const bool tactical = is_capture(m) || m.is_promote();
+		const bool isKiller = ctx && (m == ctx->killer[ply][0] || m == ctx->killer[ply][1]);
+		const bool isTT     = ttRaw != 0 && m.raw() == ttRaw;
+		// futility: 王手になる手は読む(gives_check は do_move より安い)
+		if (futile && searched > 0 && !tactical && !isTT && !pos.gives_check(m))
+			continue;
 		StateInfo  st;
 		pos.do_move(m, st);
-		Value v = -search(pos, depth - 1, -beta, -alpha, ply + 1);
+		// 着手後に相手玉が王手されていれば、この手は王手(手番は相手に移っている)
+		const bool givesCheck = pos.in_check();
+		Value v;
+		if (searched == 0 || !usePvs) {
+			v = -search(pos, depth - 1, -beta, -alpha, ply + 1);
+		} else {
+			// LMR: 遅い quiet 手は浅く null 窓で読み、α を超えたときだけ戻す
+			int r = 0;
+			if (useLmr && !tactical && !givesCheck && !isKiller && !isTT
+			    && searched >= cfg->lmrStart) {
+				r = 1;
+				if (searched >= 12 && depth >= 5)
+					r = 2;
+			}
+			// 短縮は深さ1を下限にする(0 にすると qsearch になり、短縮の
+			// 「浅く読む」ではなく「読まない」になる)。短縮しないときは素の depth−1
+			// (=0 なら qsearch)。ここを一律 max(1, …) にすると depth 1 のノードで
+			// 深さが減らず MAX_PLY まで再帰する
+			const int d1 = r > 0 ? std::max(1, depth - 1 - r) : depth - 1;
+			v = -search(pos, d1, -alpha - 1, -alpha, ply + 1);
+			if (r > 0 && v > alpha)
+				v = -search(pos, depth - 1, -alpha - 1, -alpha, ply + 1);
+			// null 窓で α を超えた(β には届いていない)= 本当の値が要る。全窓で読み直す
+			if (v > alpha && v < beta)
+				v = -search(pos, depth - 1, -beta, -alpha, ply + 1);
+		}
 		pos.undo_move(m);
+		++searched;
 		if (v > best) {
 			best = v;
 			bestMove = m;
@@ -504,6 +579,11 @@ Value DSearch::search(Position& pos, int depth, Value alpha, Value beta, int ply
 			}
 		}
 	}
+	// futility で quiet 手を飛ばしたノードの下限: 飛ばした手は「α に届かない」と
+	// みなしたので、静的評価+余白(≤ α)を fail-low の値として残す。
+	// 読んだ手が1つもない(最初の手だけは必ず読むので起きない)としても値は出る
+	if (futile)
+		best = std::max(best, Value(staticEval + cfg->futility));
 
 	// --- 置換表ストア ---
 	// nodesLimit を超えた探索は途中で静的評価を返しており値が汚れているので書かない。

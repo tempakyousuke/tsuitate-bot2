@@ -155,6 +155,14 @@ bool set_config_key(Config& c, const std::string& key, const std::string& val) {
 	else if (key == "tt")           apply_i(c.tt, -1, 1);   // -1 = auto(予算 ttautoms 以上で有効)
 	else if (key == "ttautoms")     apply_i(c.ttAutoMs, 0, 3600000);
 	else if (key == "hist")         apply_i(c.hist, 0, 1);
+	// §11 探索の枝刈り(Config 参照)
+	else if (key == "pvs")          apply_i(c.pvs, 0, 1);
+	else if (key == "nmp")          apply_i(c.nmp, 0, 1);
+	else if (key == "nmpr")         apply_i(c.nmpR, 1, 6);
+	else if (key == "lmr")          apply_i(c.lmr, 0, 1);
+	else if (key == "lmrstart")     apply_i(c.lmrStart, 1, 100);
+	else if (key == "lmrdepth")     apply_i(c.lmrDepth, 2, Config::kMaxSearchDepth);
+	else if (key == "futility")     apply_i(c.futility, 0, 5000);
 	else if (key == "nlpct")        apply_d(c.nodesLimitPct, 0.0, 100.0);
 	else if (key == "tmhorizon")    apply_i(c.tmHorizon, 1, 1000);
 	// 下限 300 = 平常時の予算の下限(cmd_go)。それ未満を受け付けると床に黙って負ける
@@ -308,10 +316,13 @@ void cmd_check_policy(long long games, long long maxPlies) {
 //     検証: 前後で hash が一致すれば探索木は同一(値もノード数も一致)
 //   - nps の退行監視(アリーナの knps は時間門と粒子数に依存して比較しにくい)
 // oppmodel を渡せば相手ノード(opp_node)の経路も同じ規約で測れる。
-void cmd_bench(long long games, long long maxPlies, long long depth, long long oppModel,
-               long long tt) {
+// base: 現在の `set` 済みの設定(§11 の枝刈りフラグなど、bench の引数に無い軸は
+// ここから引き継ぐ。`set pvs 1` → `bench …` で枝刈りの効きを測る)。
+// tt / hist / oppModel は引数が上書きする。
+void cmd_bench(const Config& base, long long games, long long maxPlies, long long depth,
+               long long oppModel, long long tt) {
 	PRNG rng(20260916);
-	Config cfg;
+	Config cfg = base;
 	cfg.oppModel = int(oppModel);
 	// mode: 0 = 素の探索(hist 0 / tt 0) / 1 = 置換表+killer/history(tt 1) /
 	// 2 = killer/history だけ(hist 1 / tt 0)。Config に写してから think() と同じ
@@ -361,7 +372,10 @@ void cmd_bench(long long games, long long maxPlies, long long depth, long long o
 	}
 	const TimePoint ms = now() - t0;
 	sync_cout << "info string bench positions=" << positions << " depth=" << depth
-	          << " oppmodel=" << oppModel << " tt=" << tt << " nodes=" << nodes << " value_sum=" << valueSum
+	          << " oppmodel=" << oppModel << " tt=" << tt
+	          << " pvs=" << cfg.pvs << " nmp=" << cfg.nmp << " lmr=" << cfg.lmr
+	          << " futility=" << cfg.futility
+	          << " nodes=" << nodes << " value_sum=" << valueSum
 	          << " hash=" << std::hex << hash << std::dec << " ms=" << ms
 	          << " knps=" << (ms > 0 ? double(nodes) / double(ms) : 0.0) << sync_endl;
 }
@@ -506,7 +520,7 @@ private:
 			if (bad)
 				sync_cout << "info string bench aborted" << sync_endl;
 			else
-				cmd_bench(games, plies, depth, oppModel, tt);
+				cmd_bench(cfg_, games, plies, depth, oppModel, tt);
 		}
 		else
 			sync_cout << "info string unknown command: " << cmd << sync_endl;
