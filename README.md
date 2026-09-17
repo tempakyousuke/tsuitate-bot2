@@ -171,7 +171,14 @@ TSUITATE_URL=http://localhost:5199 TSUITATE_BOT_TOKEN=tsb_b npm start &
 詳細は [docs/design.md](docs/design.md)。次版に向けた強化設計と実測は
 [docs/strengthening.md](docs/strengthening.md)。
 
-最新の変更(docs/strengthening.md 10章): 実対局では予算式が3秒で頭打ちで、
+最新の変更(docs/strengthening.md 11章): 確定化探索に PVS(null窓)・null move・
+LMR・futility の枝刈りを入れた(既定オン、`pvs 0` で従来の探索に戻る)。
+固定深さのベンチで PVS は値を変えずに深さ4のノード数 −61〜68%、深さ6 −37〜46%、
+4つ合わせて深さ6の木が **1/5〜1/7**。200ms のアリーナ(60局)は中立だが、
+1000ms(30局)では 58.3%・反則率と brier が3seedとも改善・avg_depth +0.6 で、
+実対局の予算帯(深さ6〜8)ほど効く。
+
+その前の変更(docs/strengthening.md 10章): 実対局では予算式が3秒で頭打ちで、
 探索も深さ上限6に1.3秒で当たって止まり、持ち時間300秒がほぼ使われていなかった。
 時間管理を銀行の幾何配分(序盤12秒)に変え、深さ上限8とノード上限の予算連動で
 使い切るようにした。探索自体もノードごとの割り当て除去で knps +16〜26%、
